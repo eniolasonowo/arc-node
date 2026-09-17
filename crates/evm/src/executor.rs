@@ -391,7 +391,10 @@ where
         let gas_limit_config = self.chain_spec.block_gas_limit_config(block_number);
         let expected = protocol_config::expected_gas_limit(fee_params.as_ref(), &gas_limit_config);
 
-        if block_gas_limit != expected {
+        // Simulations (eth_simulateV1 with validation=false) mark themselves via
+        // disable_block_gas_limit and may use arbitrary gas limits; ADR-0003 only
+        // applies to real blocks.
+        if !self.evm.cfg_env().disable_block_gas_limit && block_gas_limit != expected {
             return Err(BlockExecutionError::Validation(
                 BlockValidationError::Other(
                     format!("block gas limit {block_gas_limit} does not match expected {expected}")
