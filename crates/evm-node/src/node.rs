@@ -292,6 +292,9 @@ pub struct ArcRpcConfig {
     pub enabled: bool,
     /// Optional upstream `malachite-app` RPC URL.
     pub upstream_url: Option<String>,
+    /// Optional receiver for pool-state snapshots published by the pool-state
+    /// ExEx; enables the `poolState` RPC namespace.
+    pub pool_state_rx: Option<tokio::sync::watch::Receiver<crate::rpc::pool_state::PoolStateSnapshot>>,
 }
 
 impl ArcRpcConfig {
@@ -299,7 +302,17 @@ impl ArcRpcConfig {
         Self {
             enabled,
             upstream_url,
+            pool_state_rx: None,
         }
+    }
+
+    /// Attaches a pool-state snapshot receiver, enabling the `poolState` namespace.
+    pub fn with_pool_state_rx(
+        mut self,
+        rx: tokio::sync::watch::Receiver<crate::rpc::pool_state::PoolStateSnapshot>,
+    ) -> Self {
+        self.pool_state_rx = Some(rx);
+        self
     }
 }
 
@@ -466,6 +479,12 @@ where
                     {
                         container.modules.merge_configured(arc_module)?;
                     }
+                }
+
+                if let Some(pool_state_rx) = self.arc_rpc.pool_state_rx.clone() {
+                    container.modules.merge_configured(
+                        crate::rpc::pool_state::build_pool_state_rpc_module(pool_state_rx),
+                    )?;
                 }
 
                 Ok(())

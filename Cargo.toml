@@ -189,6 +189,7 @@ reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2
 reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
 reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
 reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
+reth-exex = { git = "https://github.com/eniolasonowo/reth", branch = "eth_simulateV1-v2.2.0" }
 reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0", default-features = false }
 reth-execution-cache = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
 reth-fs-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }

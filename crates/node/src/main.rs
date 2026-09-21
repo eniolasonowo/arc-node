@@ -163,6 +163,41 @@ struct ArcExtraCli {
     )]
     arc_rpc_upstream_url: Option<String>,
 
+    /// Enable the pool-state ExEx: per-block tick-range refresh via
+    /// getMultiTicksRange, served through the poolState RPC namespace.
+    #[arg(long = "exex.pool-state", default_value_t = false, help_heading = "Arc ExEx")]
+    exex_pool_state: bool,
+
+    /// Contract exposing getMultiTicksRange (required with --exex.pool-state).
+    #[arg(
+        long = "exex.pool-state.call-contract",
+        value_name = "ADDRESS",
+        requires = "exex_pool_state",
+        help_heading = "Arc ExEx"
+    )]
+    exex_pool_state_contract: Option<alloy_primitives::Address>,
+
+    /// Topic0 filter for the pool-state ExEx; defaults to the standard
+    /// V3/PancakeV3 Swap, Mint, Burn and V4 Swap, ModifyLiquidity topics.
+    #[arg(
+        long = "exex.pool-state.topics",
+        value_name = "TOPICS",
+        value_delimiter = ',',
+        requires = "exex_pool_state",
+        help_heading = "Arc ExEx"
+    )]
+    exex_pool_state_topics: Option<Vec<alloy_primitives::B256>>,
+
+    /// Loopback RPC URL the pool-state ExEx uses for its eth_calls.
+    #[arg(
+        long = "exex.pool-state.node-rpc",
+        value_name = "URL",
+        default_value = "http://127.0.0.1:8545",
+        requires = "exex_pool_state",
+        help_heading = "Arc ExEx"
+    )]
+    exex_pool_state_node_rpc: String,
+
     /// Run an RPC node (unsafe - no verification).
     ///
     /// Use without a value (--unsafe-follow) to automatically use the preconfigured trusted node or
@@ -575,8 +610,27 @@ fn main() {
             // Resolved from the chain spec, so this must happen after the spec is parsed.
             let addresses_denylist_config =
                 build_addresses_denylist_config(builder.config().chain.as_ref(), &ext)?;
+            let pool_state_cfg = if ext.exex_pool_state {
+                let contract = ext.exex_pool_state_contract.ok_or_else(|| {
+                    eyre::eyre!("--exex.pool-state requires --exex.pool-state.call-contract")
+                })?;
+                Some(arc_evm_node::exex::PoolStateConfig::new(
+                    contract,
+                    ext.exex_pool_state_topics.clone(),
+                    ext.exex_pool_state_node_rpc.clone(),
+                ))
+            } else {
+                None
+            };
+            let (pool_state_tx, pool_state_rx) =
+                tokio::sync::watch::channel(Default::default());
             let arc_rpc_cfg =
                 ArcRpcConfig::new(ext.enable_arc_rpc, ext.arc_rpc_upstream_url.clone());
+            let arc_rpc_cfg = if pool_state_cfg.is_some() {
+                arc_rpc_cfg.with_pool_state_rx(pool_state_rx)
+            } else {
+                arc_rpc_cfg
+            };
             let invalid_tx_list_cfg =
                 InvalidTxListConfig::new(ext.invalid_tx_list_enable, ext.invalid_tx_list_cap);
             let payload_builder_deadline_ms = ext.payload_builder_deadline_ms;
@@ -626,6 +680,15 @@ fn main() {
                     tx_relays,
                     tx_relay_timeout,
                 ))
+                .install_exex_if(
+                    ext.exex_pool_state,
+                    "pool-state",
+                    move |ctx| async move {
+                        let cfg = pool_state_cfg
+                            .expect("install_exex_if guarantees the config is present");
+                        Ok(arc_evm_node::exex::pool_state_exex(ctx, cfg, pool_state_tx))
+                    },
+                )
                 .launch_with_debug_capabilities()
                 .await?;
 
