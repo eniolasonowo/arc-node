@@ -36,8 +36,9 @@ pub const TOPIC_UNISWAP_V3_SWAP: B256 = b256!(
     "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
 );
 
-/// PancakeV3 `Swap` (same signature as UniswapV3, same topic0).
-pub const TOPIC_PANCAKE_V3_SWAP: B256 = TOPIC_UNISWAP_V3_SWAP;
+/// PancakeV3 `Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint128 protocolFeesToken0,uint128 protocolFeesToken1)`.
+pub const TOPIC_PANCAKE_V3_SWAP: B256 =
+    b256!("0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83");
 
 /// V3 `Mint(address,address indexed owner,int24 indexed tickLower,int24 indexed tickUpper,uint128,uint256,uint256)`.
 pub const TOPIC_V3_MINT: B256 =
@@ -59,6 +60,7 @@ pub const TOPIC_V4_SWAP: B256 =
 pub fn default_topics() -> Vec<B256> {
     vec![
         TOPIC_UNISWAP_V3_SWAP,
+        TOPIC_PANCAKE_V3_SWAP,
         TOPIC_V3_MINT,
         TOPIC_V3_BURN,
         TOPIC_V4_MODIFY_LIQUIDITY,

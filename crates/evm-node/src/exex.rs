@@ -30,8 +30,8 @@
 
 use crate::rpc::pool_state::{
     default_topics, PoolStateEntry, PoolStateSnapshot, PoolStateWatch, TickRangeEntry,
-    IPoolState, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT, TOPIC_V4_MODIFY_LIQUIDITY,
-    TOPIC_V4_SWAP,
+    IPoolState, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT,
+    TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
 };
 use alloy_consensus::{BlockHeader as _, TxReceipt as _};
 use alloy_primitives::{hex, Address, B256, Log, Signed};
@@ -80,6 +80,25 @@ mod v3_events {
     }
 }
 
+/// PancakeV3 event bindings (signature extends UniswapV3's Swap with two
+/// trailing protocol-fee fields, hence a different topic0).
+mod pancake_events {
+    alloy_sol_types::sol! {
+        #[derive(Debug)]
+        event Swap(
+            address indexed sender,
+            address indexed recipient,
+            int256 amount0,
+            int256 amount1,
+            uint160 sqrtPriceX96,
+            uint128 liquidity,
+            int24 tick,
+            uint128 protocolFeesToken0,
+            uint128 protocolFeesToken1
+        );
+    }
+}
+
 /// V4 event bindings.
 mod v4_events {
     alloy_sol_types::sol! {
@@ -101,7 +120,8 @@ mod v4_events {
             address indexed sender,
             int24 tickLower,
             int24 tickUpper,
-            int256 liquidityDelta
+            int256 liquidityDelta,
+            bytes32 extra
         );
     }
 }
@@ -290,6 +310,10 @@ fn process_log(log: &Log, topics: &[B256], selections: &mut BTreeMap<B256, Selec
             Ok(event) => insert_swap(selections, pool_word, to_i32(event.tick)),
             Err(err) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Swap log"),
         },
+        t if t == TOPIC_PANCAKE_V3_SWAP => match pancake_events::Swap::decode_log(log) {
+            Ok(event) => insert_swap(selections, pool_word, to_i32(event.tick)),
+            Err(err) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode pancake v3 Swap log"),
+        },
         t if t == TOPIC_V3_MINT => match v3_events::Mint::decode_log(log) {
             Ok(event) => insert_liquidity(selections, pool_word, to_i32(event.tickLower)),
             Err(err) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Mint log"),
@@ -348,4 +372,67 @@ async fn call_get_multi_ticks_range(
         .ok_or_else(|| eyre::eyre!("eth_call response missing result"))?;
     let output = hex::decode(result.trim_start_matches("0x"))?;
     Ok(IPoolState::getMultiTicksRangeCall::abi_decode_returns(&output)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::pool_state::{
+        TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT,
+        TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
+    };
+    use alloy_sol_types::SolEvent;
+
+    /// Each topic0 filter constant must equal the signature hash of the event
+    /// binding used to decode it; otherwise logs would silently stop matching.
+    #[test]
+    fn topic_constants_match_event_bindings() {
+        assert_eq!(
+            TOPIC_UNISWAP_V3_SWAP,
+            v3_events::Swap::SIGNATURE_HASH,
+            "uniswap v3 swap topic drifted from its binding"
+        );
+        assert_ne!(
+            TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP,
+            "pancake v3 swap topic must differ from uniswap v3's"
+        );
+        assert_eq!(
+            TOPIC_PANCAKE_V3_SWAP,
+            pancake_events::Swap::SIGNATURE_HASH,
+            "pancake v3 swap topic drifted from its binding"
+        );
+        assert_eq!(TOPIC_V3_MINT, v3_events::Mint::SIGNATURE_HASH);
+        assert_eq!(TOPIC_V3_BURN, v3_events::Burn::SIGNATURE_HASH);
+        assert_eq!(TOPIC_V4_SWAP, v4_events::Swap::SIGNATURE_HASH);
+        assert_eq!(
+            TOPIC_V4_MODIFY_LIQUIDITY,
+            v4_events::ModifyLiquidity::SIGNATURE_HASH
+        );
+    }
+
+    /// The default topic filter must contain every supported topic exactly once.
+    #[test]
+    fn default_topics_cover_all_supported() {
+        let mut topics = default_topics();
+        topics.sort();
+        topics.dedup();
+        assert_eq!(
+            topics.len(),
+            default_topics().len(),
+            "default topic list contains duplicates"
+        );
+        for expected in [
+            TOPIC_UNISWAP_V3_SWAP,
+            TOPIC_PANCAKE_V3_SWAP,
+            TOPIC_V3_MINT,
+            TOPIC_V3_BURN,
+            TOPIC_V4_MODIFY_LIQUIDITY,
+            TOPIC_V4_SWAP,
+        ] {
+            assert!(
+                default_topics().contains(&expected),
+                "default topic list missing {expected}"
+            );
+        }
+    }
 }
