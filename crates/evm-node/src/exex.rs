@@ -33,14 +33,19 @@ use crate::rpc::pool_state::{
     IPoolState, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT,
     TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
 };
-use alloy_consensus::{BlockHeader as _, TxReceipt as _};
-use alloy_primitives::{hex, Address, B256, Log, Signed};
+use alloy_consensus::{BlockHeader as _, TxEip1559, TxReceipt as _};
+use alloy_primitives::{Address, Bytes, B256, Log, Signed, TxKind};
 use alloy_sol_types::{SolCall, SolEvent};
 use futures::TryStreamExt;
+use arc_evm::ArcEvmConfig;
+use reth_evm::{ConfigureEvm, Evm as _};
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::{FullNodeComponents, NodeTypes};
-use reth_primitives_traits::NodePrimitives;
-use reth_provider::Chain;
+use reth_ethereum_primitives::EthPrimitives;
+use reth_primitives_traits::Recovered;
+use reth_provider::{Chain, StateProviderFactory};
+use reth_revm::{database::StateProviderDatabase, db::State};
+use revm::context_interface::result::ResultAndState;
 use std::collections::BTreeMap;
 
 /// V3-family event bindings (UniswapV3 / PancakeV3 share signatures).
@@ -133,17 +138,14 @@ pub struct PoolStateConfig {
     pub contract: Address,
     /// Topic0 filter; defaults to [`default_topics`].
     pub topics: Vec<B256>,
-    /// Loopback RPC URL used for the `eth_call`s.
-    pub http_url: String,
 }
 
 impl PoolStateConfig {
     /// Builds a config, falling back to the default topic set.
-    pub fn new(contract: Address, topics: Option<Vec<B256>>, http_url: String) -> Self {
+    pub fn new(contract: Address, topics: Option<Vec<B256>>) -> Self {
         Self {
             contract,
             topics: topics.unwrap_or_else(default_topics),
-            http_url,
         }
     }
 }
@@ -162,29 +164,41 @@ pub async fn pool_state_exex<N>(
     watch: PoolStateWatch,
 ) -> eyre::Result<()>
 where
-    N: FullNodeComponents,
-    <N::Types as NodeTypes>::Primitives:
-        NodePrimitives<Receipt: alloy_consensus::TxReceipt<Log = Log>>,
+    N: FullNodeComponents<
+        Evm = ArcEvmConfig,
+        Provider: StateProviderFactory + Clone + Unpin + 'static,
+        Types: NodeTypes<Primitives = EthPrimitives>,
+    >,
 {
-    let http = reqwest::Client::new();
     let exex_id = "pool-state";
 
     tracing::info!(
         target: "arc::exex::pool_state",
         contract = %cfg.contract,
         topics = cfg.topics.len(),
-        http_url = %cfg.http_url,
         "pool-state ExEx started"
     );
 
     while let Some(notification) = ctx.notifications.try_next().await? {
         match &notification {
             ExExNotification::ChainCommitted { new } => {
-                process_chain(new, &cfg, &http, &watch).await;
+                process_chain::<N>(
+                    new,
+                    &cfg,
+                    ctx.components.evm_config(),
+                    ctx.components.provider(),
+                    &watch,
+                );
             }
             ExExNotification::ChainReorged { new, .. } => {
                 // Recompute the snapshot from the new chain.
-                process_chain(new, &cfg, &http, &watch).await;
+                process_chain::<N>(
+                    new,
+                    &cfg,
+                    ctx.components.evm_config(),
+                    ctx.components.provider(),
+                    &watch,
+                );
             }
             ExExNotification::ChainReverted { .. } => {
                 // State will be refreshed by the next committed chain.
@@ -203,13 +217,14 @@ where
 
 /// Scans a committed chain for matching events, batches one
 /// `getMultiTicksRange` call at the chain tip and publishes the snapshot.
-async fn process_chain<N>(
-    chain: &Chain<N>,
+fn process_chain<N>(
+    chain: &Chain<<N::Types as NodeTypes>::Primitives>,
     cfg: &PoolStateConfig,
-    http: &reqwest::Client,
+    evm_config: &N::Evm,
+    provider: &N::Provider,
     watch: &PoolStateWatch,
 ) where
-    N: NodePrimitives<Receipt: alloy_consensus::TxReceipt<Log = Log>>,
+    N: FullNodeComponents<Evm = ArcEvmConfig, Types: NodeTypes<Primitives = EthPrimitives>>,
 {
     let mut selections: BTreeMap<B256, Selection> = BTreeMap::new();
     for block in chain.blocks_iter() {
@@ -236,7 +251,9 @@ async fn process_chain<N>(
         })
         .collect();
 
-    let returns = match call_get_multi_ticks_range(http, cfg, &args, tip.hash()).await {
+    let returns = match execute_get_multi_ticks_range(
+        evm_config, provider, cfg.contract, &args, tip.header(), tip.hash(),
+    ) {
         Ok(returns) => returns,
         Err(err) => {
             tracing::warn!(
@@ -251,7 +268,7 @@ async fn process_chain<N>(
 
     let entries: Vec<PoolStateEntry> = selections
         .iter()
-        .zip(returns.into_iter())
+        .zip(returns)
         .map(|((pool_id, sel), info)| PoolStateEntry {
             pool_id: format!("{pool_id:#x}"),
             tick: sel.tick,
@@ -340,37 +357,52 @@ fn process_log(log: &Log, topics: &[B256], selections: &mut BTreeMap<B256, Selec
     }
 }
 
-/// Executes `getMultiTicksRange` at the given block hash via the loopback RPC.
-async fn call_get_multi_ticks_range(
-    http: &reqwest::Client,
-    cfg: &PoolStateConfig,
+/// Executes `getMultiTicksRange` against the state at the given block,
+/// in-process, mirroring reth's `eth_call` handling (see
+/// `prepare_call_env` in `rpc-eth-api/src/helpers/call.rs`): sender `0x0`,
+/// zero gas price, and the same cfg relaxations.
+fn execute_get_multi_ticks_range(
+    evm_config: &ArcEvmConfig,
+    provider: &(impl StateProviderFactory + Clone + Unpin + 'static),
+    contract: Address,
     args: &[IPoolState::ITicksRangeArgs],
+    header: &alloy_consensus::Header,
     at: B256,
 ) -> eyre::Result<Vec<IPoolState::IRangeTickInfoLpFee>> {
     let call = IPoolState::getMultiTicksRangeCall { args: args.to_vec() };
-    let calldata = call.abi_encode();
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_call",
-        "params": [
-            {
-                "to": cfg.contract.to_checksum(None),
-                "data": hex::encode_prefixed(calldata),
-            },
-            { "blockHash": hex::encode_prefixed(at) }
-        ]
-    });
+    let calldata: Bytes = call.abi_encode().into();
 
-    let response: serde_json::Value =
-        http.post(&cfg.http_url).json(&body).send().await?.error_for_status()?.json().await?;
-    if let Some(error) = response.get("error") {
-        eyre::bail!("eth_call error response: {error}");
-    }
-    let result = response["result"]
-        .as_str()
-        .ok_or_else(|| eyre::eyre!("eth_call response missing result"))?;
-    let output = hex::decode(result.trim_start_matches("0x"))?;
+    let state = provider.history_by_block_hash(at)?;
+
+    let mut evm_env = evm_config.evm_env(header)?;
+
+    // Same relaxations `prepare_call_env` applies for `eth_call`.
+    evm_env.cfg_env.disable_nonce_check = true;
+    evm_env.cfg_env.disable_base_fee = true;
+    evm_env.cfg_env.disable_eip3607 = true;
+    evm_env.cfg_env.disable_block_gas_limit = true;
+    evm_env.cfg_env.disable_fee_charge = true;
+    evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+
+    let tx = TxEip1559 {
+        gas_limit: u64::MAX,
+        to: TxKind::Call(contract),
+        input: calldata,
+        // zero fees: no balance needed for the zeroed caller
+        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: 0,
+        ..Default::default()
+    };
+
+    let tx_env = evm_config.tx_env(Recovered::new_unchecked(tx, Address::ZERO));
+
+    let db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+    let mut evm = evm_config.evm_with_env(db, evm_env);
+    let ResultAndState { result, .. } = evm.transact_raw(tx_env)?;
+    let output = result
+        .into_output()
+        .ok_or_else(|| eyre::eyre!("getMultiTicksRange call returned no output"))?;
+
     Ok(IPoolState::getMultiTicksRangeCall::abi_decode_returns(&output)?)
 }
 
@@ -436,3 +468,11 @@ mod tests {
         }
     }
 }
+
+
+#[allow(dead_code)]
+fn probe_tx_env_conversion(evm_config: &ArcEvmConfig) {
+    let tx = TxEip1559::default();
+    let _unused = evm_config.tx_env(Recovered::new_unchecked(tx, Address::ZERO));
+}
+

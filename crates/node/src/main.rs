@@ -188,16 +188,6 @@ struct ArcExtraCli {
     )]
     exex_pool_state_topics: Option<Vec<alloy_primitives::B256>>,
 
-    /// Loopback RPC URL the pool-state ExEx uses for its eth_calls.
-    #[arg(
-        long = "exex.pool-state.node-rpc",
-        value_name = "URL",
-        default_value = "http://127.0.0.1:8545",
-        requires = "exex_pool_state",
-        help_heading = "Arc ExEx"
-    )]
-    exex_pool_state_node_rpc: String,
-
     /// Run an RPC node (unsafe - no verification).
     ///
     /// Use without a value (--unsafe-follow) to automatically use the preconfigured trusted node or
@@ -617,7 +607,6 @@ fn main() {
                 Some(arc_evm_node::exex::PoolStateConfig::new(
                     contract,
                     ext.exex_pool_state_topics.clone(),
-                    ext.exex_pool_state_node_rpc.clone(),
                 ))
             } else {
                 None
