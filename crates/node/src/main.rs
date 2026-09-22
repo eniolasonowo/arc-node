@@ -168,14 +168,23 @@ struct ArcExtraCli {
     #[arg(long = "exex.pool-state", default_value_t = false, help_heading = "Arc ExEx")]
     exex_pool_state: bool,
 
-    /// Contract exposing getMultiTicksRange (required with --exex.pool-state).
+    /// V3-family contract exposing getMultiTicksRange (address-keyed pools).
     #[arg(
-        long = "exex.pool-state.call-contract",
+        long = "exex.pool-state.v3-contract",
         value_name = "ADDRESS",
         requires = "exex_pool_state",
         help_heading = "Arc ExEx"
     )]
-    exex_pool_state_contract: Option<alloy_primitives::Address>,
+    exex_pool_state_v3_contract: Option<alloy_primitives::Address>,
+
+    /// V4-family contract exposing getMultiTicksRange (bytes32-keyed pools).
+    #[arg(
+        long = "exex.pool-state.v4-contract",
+        value_name = "ADDRESS",
+        requires = "exex_pool_state",
+        help_heading = "Arc ExEx"
+    )]
+    exex_pool_state_v4_contract: Option<alloy_primitives::Address>,
 
     /// Topic0 filter for the pool-state ExEx; defaults to the standard
     /// V3/PancakeV3 Swap, Mint, Burn and V4 Swap, ModifyLiquidity topics.
@@ -601,11 +610,17 @@ fn main() {
             let addresses_denylist_config =
                 build_addresses_denylist_config(builder.config().chain.as_ref(), &ext)?;
             let pool_state_cfg = if ext.exex_pool_state {
-                let contract = ext.exex_pool_state_contract.ok_or_else(|| {
-                    eyre::eyre!("--exex.pool-state requires --exex.pool-state.call-contract")
-                })?;
+                let contract_v3 = ext.exex_pool_state_v3_contract;
+                let contract_v4 = ext.exex_pool_state_v4_contract;
+                if contract_v3.is_none() && contract_v4.is_none() {
+                    return Err(eyre::eyre!(
+                        "--exex.pool-state requires at least one of --exex.pool-state.v3-contract \
+                         or --exex.pool-state.v4-contract"
+                    ));
+                }
                 Some(arc_evm_node::exex::PoolStateConfig::new(
-                    contract,
+                    contract_v3,
+                    contract_v4,
                     ext.exex_pool_state_topics.clone(),
                 ))
             } else {

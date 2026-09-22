@@ -68,9 +68,33 @@ pub fn default_topics() -> Vec<B256> {
     ]
 }
 
+// V3-family tick-range contract: pools are identified by address.
 sol! {
     #[derive(Debug)]
-    interface IPoolState {
+    interface IV3PoolState {
+        struct ITicksRangeArgs {
+            address pool;
+            int24 tick;
+        }
+        struct IRangeTickInfo {
+            int24 tickIndex;
+            int128 liquidityNet;
+        }
+        struct IRangeTickInfoLpFee {
+            uint24 lpFee;
+            IRangeTickInfo[] range;
+        }
+        function getMultiTicksRange(ITicksRangeArgs[] memory args)
+            external
+            view
+            returns (IRangeTickInfoLpFee[] memory multiPoolInfo);
+    }
+}
+
+// V4-family tick-range contract: pools are identified by bytes32 id.
+sol! {
+    #[derive(Debug)]
+    interface IV4PoolState {
         struct ITicksRangeArgs {
             bytes32 poolId;
             int24 tick;

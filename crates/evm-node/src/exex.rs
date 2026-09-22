@@ -30,8 +30,8 @@
 
 use crate::rpc::pool_state::{
     default_topics, PoolStateEntry, PoolStateSnapshot, PoolStateWatch, TickRangeEntry,
-    IPoolState, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT,
-    TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
+    IV3PoolState, IV4PoolState, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN,
+    TOPIC_V3_MINT, TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
 };
 use alloy_consensus::{BlockHeader as _, TxEip1559, TxReceipt as _};
 use alloy_primitives::{Address, Bytes, B256, Log, Signed, TxKind};
@@ -134,17 +134,25 @@ mod v4_events {
 /// Pool-state ExEx configuration.
 #[derive(Debug, Clone)]
 pub struct PoolStateConfig {
-    /// Contract exposing `getMultiTicksRange`.
-    pub contract: Address,
+    /// V3-family contract exposing `getMultiTicksRange` (address-keyed pools).
+    pub contract_v3: Option<Address>,
+    /// V4-family contract exposing `getMultiTicksRange` (bytes32-keyed pools).
+    pub contract_v4: Option<Address>,
     /// Topic0 filter; defaults to [`default_topics`].
     pub topics: Vec<B256>,
 }
 
 impl PoolStateConfig {
-    /// Builds a config, falling back to the default topic set.
-    pub fn new(contract: Address, topics: Option<Vec<B256>>) -> Self {
+    /// Builds a config, falling back to the default topic set. Families
+    /// without a configured contract are not tracked.
+    pub fn new(
+        contract_v3: Option<Address>,
+        contract_v4: Option<Address>,
+        topics: Option<Vec<B256>>,
+    ) -> Self {
         Self {
-            contract,
+            contract_v3,
+            contract_v4,
             topics: topics.unwrap_or_else(default_topics),
         }
     }
@@ -174,7 +182,8 @@ where
 
     tracing::info!(
         target: "arc::exex::pool_state",
-        contract = %cfg.contract,
+        contract_v3 = ?cfg.contract_v3,
+        contract_v4 = ?cfg.contract_v4,
         topics = cfg.topics.len(),
         "pool-state ExEx started"
     );
@@ -226,63 +235,137 @@ fn process_chain<N>(
 ) where
     N: FullNodeComponents<Evm = ArcEvmConfig, Types: NodeTypes<Primitives = EthPrimitives>>,
 {
-    let mut selections: BTreeMap<B256, Selection> = BTreeMap::new();
+    // Per-family pool selections; a family without a configured contract is
+    // not tracked at all.
+    let mut selections_v3: BTreeMap<Address, Selection> = BTreeMap::new();
+    let mut selections_v4: BTreeMap<B256, Selection> = BTreeMap::new();
     for block in chain.blocks_iter() {
         let Some(receipts) = chain.receipts_by_block_hash(block.hash()) else {
             continue;
         };
         for receipt in receipts {
             for log in receipt.logs() {
-                process_log(log, &cfg.topics, &mut selections);
+                process_log(log, cfg, &mut selections_v3, &mut selections_v4);
             }
         }
     }
 
-    if selections.is_empty() {
+    if selections_v3.is_empty() && selections_v4.is_empty() {
         return;
     }
 
     let tip = chain.tip();
-    let args: Vec<IPoolState::ITicksRangeArgs> = selections
-        .iter()
-        .map(|(pool_id, sel)| IPoolState::ITicksRangeArgs {
-            poolId: *pool_id,
-            tick: Signed::<24, 1>::try_from(sel.tick).unwrap_or_default(),
-        })
-        .collect();
+    let mut entries: Vec<PoolStateEntry> = Vec::new();
 
-    let returns = match execute_get_multi_ticks_range(
-        evm_config, provider, cfg.contract, &args, tip.header(), tip.hash(),
-    ) {
-        Ok(returns) => returns,
-        Err(err) => {
-            tracing::warn!(
+    if let (Some(contract), false) = (cfg.contract_v3, selections_v3.is_empty()) {
+        let args: Vec<IV3PoolState::ITicksRangeArgs> = selections_v3
+            .iter()
+            .map(|(pool, sel)| IV3PoolState::ITicksRangeArgs {
+                pool: *pool,
+                tick: Signed::<24, 1>::try_from(sel.tick).unwrap_or_default(),
+            })
+            .collect();
+
+        match execute_eth_call(
+            evm_config,
+            provider,
+            contract,
+            IV3PoolState::getMultiTicksRangeCall { args }.abi_encode().into(),
+            tip.header(),
+            tip.hash(),
+        ) {
+            Ok(output) => match IV3PoolState::getMultiTicksRangeCall::abi_decode_returns(&output)
+            {
+                Ok(returns) => {
+                    entries.extend(selections_v3.iter().zip(returns).map(|((pool, sel), info)| {
+                        PoolStateEntry {
+                            pool_id: format!("{pool:#x}"),
+                            tick: sel.tick,
+                            lp_fee: u32::try_from(info.lpFee).unwrap_or_default(),
+                            range: info
+                                .range
+                                .iter()
+                                .map(|tick| TickRangeEntry {
+                                    tick_index: i32::try_from(tick.tickIndex)
+                                        .unwrap_or_default(),
+                                    liquidity_net: tick.liquidityNet.to_string(),
+                                })
+                                .collect(),
+                        }
+                    }));
+                }
+                Err(err) => tracing::warn!(
+                    target: "arc::exex::pool_state",
+                    block_number = tip.number(),
+                    error = %err,
+                    "failed to decode v3 getMultiTicksRange output"
+                ),
+            },
+            Err(err) => tracing::warn!(
                 target: "arc::exex::pool_state",
                 block_number = tip.number(),
                 error = %err,
-                "getMultiTicksRange call failed; keeping previous snapshot"
-            );
-            return;
+                "v3 getMultiTicksRange call failed; keeping previous snapshot"
+            ),
         }
-    };
+    }
 
-    let entries: Vec<PoolStateEntry> = selections
-        .iter()
-        .zip(returns)
-        .map(|((pool_id, sel), info)| PoolStateEntry {
-            pool_id: format!("{pool_id:#x}"),
-            tick: sel.tick,
-            lp_fee: u32::try_from(info.lpFee).unwrap_or_default(),
-            range: info
-                .range
-                .iter()
-                .map(|tick| TickRangeEntry {
-                    tick_index: i32::try_from(tick.tickIndex).unwrap_or_default(),
-                    liquidity_net: tick.liquidityNet.to_string(),
-                })
-                .collect(),
-        })
-        .collect();
+    if let (Some(contract), false) = (cfg.contract_v4, selections_v4.is_empty()) {
+        let args: Vec<IV4PoolState::ITicksRangeArgs> = selections_v4
+            .iter()
+            .map(|(pool_id, sel)| IV4PoolState::ITicksRangeArgs {
+                poolId: *pool_id,
+                tick: Signed::<24, 1>::try_from(sel.tick).unwrap_or_default(),
+            })
+            .collect();
+
+        match execute_eth_call(
+            evm_config,
+            provider,
+            contract,
+            IV4PoolState::getMultiTicksRangeCall { args }.abi_encode().into(),
+            tip.header(),
+            tip.hash(),
+        ) {
+            Ok(output) => match IV4PoolState::getMultiTicksRangeCall::abi_decode_returns(&output)
+            {
+                Ok(returns) => {
+                    entries.extend(selections_v4.iter().zip(returns).map(
+                        |((pool_id, sel), info)| PoolStateEntry {
+                            pool_id: format!("{pool_id:#x}"),
+                            tick: sel.tick,
+                            lp_fee: u32::try_from(info.lpFee).unwrap_or_default(),
+                            range: info
+                                .range
+                                .iter()
+                                .map(|tick| TickRangeEntry {
+                                    tick_index: i32::try_from(tick.tickIndex)
+                                        .unwrap_or_default(),
+                                    liquidity_net: tick.liquidityNet.to_string(),
+                                })
+                                .collect(),
+                        },
+                    ));
+                }
+                Err(err) => tracing::warn!(
+                    target: "arc::exex::pool_state",
+                    block_number = tip.number(),
+                    error = %err,
+                    "failed to decode v4 getMultiTicksRange output"
+                ),
+            },
+            Err(err) => tracing::warn!(
+                target: "arc::exex::pool_state",
+                block_number = tip.number(),
+                error = %err,
+                "v4 getMultiTicksRange call failed; keeping previous snapshot"
+            ),
+        }
+    }
+
+    if entries.is_empty() {
+        return;
+    }
 
     let snapshot = PoolStateSnapshot {
         block_number: tip.number(),
@@ -299,10 +382,17 @@ fn process_chain<N>(
     watch.send_replace(snapshot);
 }
 
-/// Applies one log to the per-pool selection map.
-fn process_log(log: &Log, topics: &[B256], selections: &mut BTreeMap<B256, Selection>) {
+/// Applies one log to the per-family selection maps. V3-family pools are
+/// keyed by address, V4-family pools by bytes32 id; families without a
+/// configured contract are skipped.
+fn process_log(
+    log: &Log,
+    cfg: &PoolStateConfig,
+    selections_v3: &mut BTreeMap<Address, Selection>,
+    selections_v4: &mut BTreeMap<B256, Selection>,
+) {
     let Some(&topic0) = log.topics().first() else { return };
-    if !topics.contains(&topic0) {
+    if !cfg.topics.contains(&topic0) {
         return;
     }
 
@@ -319,59 +409,85 @@ fn process_log(log: &Log, topics: &[B256], selections: &mut BTreeMap<B256, Selec
                 }
             }
         };
+    let insert_v3_swap =
+        |selections: &mut BTreeMap<Address, Selection>, pool: Address, tick: i32| {
+            selections.insert(pool, Selection { tick, is_swap: true });
+        };
+    let insert_v3_liquidity =
+        |selections: &mut BTreeMap<Address, Selection>, pool: Address, tick: i32| {
+            match selections.get(&pool) {
+                // A swap always outranks liquidity events for the same pool.
+                Some(sel) if sel.is_swap => {}
+                _ => {
+                    selections.insert(pool, Selection { tick, is_swap: false });
+                }
+            }
+        };
 
-    let pool_word = log.address.into_word();
     let to_i32 = |v: Signed<24, 1>| i32::try_from(v).unwrap_or_default();
     match topic0 {
-        t if t == TOPIC_UNISWAP_V3_SWAP => match v3_events::Swap::decode_log(log) {
-            Ok(event) => insert_swap(selections, pool_word, to_i32(event.tick)),
-            Err(err) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Swap log"),
+        t if t == TOPIC_UNISWAP_V3_SWAP => match (cfg.contract_v3, v3_events::Swap::decode_log(log)) {
+            (Some(_), Ok(event)) => insert_v3_swap(selections_v3, log.address, to_i32(event.tick)),
+            (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Swap log"),
+            (None, _) => {}
         },
-        t if t == TOPIC_PANCAKE_V3_SWAP => match pancake_events::Swap::decode_log(log) {
-            Ok(event) => insert_swap(selections, pool_word, to_i32(event.tick)),
-            Err(err) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode pancake v3 Swap log"),
+        t if t == TOPIC_PANCAKE_V3_SWAP => {
+            match (cfg.contract_v3, pancake_events::Swap::decode_log(log)) {
+                (Some(_), Ok(event)) => {
+                    insert_v3_swap(selections_v3, log.address, to_i32(event.tick))
+                }
+                (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode pancake v3 Swap log"),
+                (None, _) => {}
+            }
+        }
+        t if t == TOPIC_V3_MINT => match (cfg.contract_v3, v3_events::Mint::decode_log(log)) {
+            (Some(_), Ok(event)) => {
+                insert_v3_liquidity(selections_v3, log.address, to_i32(event.tickLower))
+            }
+            (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Mint log"),
+            (None, _) => {}
         },
-        t if t == TOPIC_V3_MINT => match v3_events::Mint::decode_log(log) {
-            Ok(event) => insert_liquidity(selections, pool_word, to_i32(event.tickLower)),
-            Err(err) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Mint log"),
+        t if t == TOPIC_V3_BURN => match (cfg.contract_v3, v3_events::Burn::decode_log(log)) {
+            (Some(_), Ok(event)) => {
+                insert_v3_liquidity(selections_v3, log.address, to_i32(event.tickLower))
+            }
+            (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Burn log"),
+            (None, _) => {}
         },
-        t if t == TOPIC_V3_BURN => match v3_events::Burn::decode_log(log) {
-            Ok(event) => insert_liquidity(selections, pool_word, to_i32(event.tickLower)),
-            Err(err) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Burn log"),
-        },
-        t if t == TOPIC_V4_SWAP => match v4_events::Swap::decode_log(log) {
-            Ok(event) => insert_swap(selections, event.id, to_i32(event.tick)),
-            Err(err) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v4 Swap log"),
+        t if t == TOPIC_V4_SWAP => match (cfg.contract_v4, v4_events::Swap::decode_log(log)) {
+            (Some(_), Ok(event)) => insert_swap(selections_v4, event.id, to_i32(event.tick)),
+            (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v4 Swap log"),
+            (None, _) => {}
         },
         t if t == TOPIC_V4_MODIFY_LIQUIDITY => {
-            match v4_events::ModifyLiquidity::decode_log(log) {
-                Ok(event) => insert_liquidity(selections, event.id, to_i32(event.tickLower)),
-                Err(err) => tracing::debug!(
+            match (cfg.contract_v4, v4_events::ModifyLiquidity::decode_log(log)) {
+                (Some(_), Ok(event)) => {
+                    insert_liquidity(selections_v4, event.id, to_i32(event.tickLower))
+                }
+                (Some(_), Err(err)) => tracing::debug!(
                     target: "arc::exex::pool_state",
                     error = %err,
                     "failed to decode v4 ModifyLiquidity log"
                 ),
+                (None, _) => {}
             }
         }
         _ => {}
     }
 }
 
-/// Executes `getMultiTicksRange` against the state at the given block,
+/// Executes an arbitrary call against the state at the given block,
 /// in-process, mirroring reth's `eth_call` handling (see
 /// `prepare_call_env` in `rpc-eth-api/src/helpers/call.rs`): sender `0x0`,
-/// zero gas price, and the same cfg relaxations.
-fn execute_get_multi_ticks_range(
+/// zero gas price, and the same cfg relaxations. Returns the raw output.
+fn execute_eth_call(
     evm_config: &ArcEvmConfig,
     provider: &(impl StateProviderFactory + Clone + Unpin + 'static),
     contract: Address,
-    args: &[IPoolState::ITicksRangeArgs],
+    calldata: Bytes,
     header: &alloy_consensus::Header,
     at: B256,
-) -> eyre::Result<Vec<IPoolState::IRangeTickInfoLpFee>> {
-    let call = IPoolState::getMultiTicksRangeCall { args: args.to_vec() };
-    let calldata: Bytes = call.abi_encode().into();
-
+) -> eyre::Result<Bytes> {
     let state = provider.history_by_block_hash(at)?;
 
     let mut evm_env = evm_config.evm_env(header)?;
@@ -399,11 +515,9 @@ fn execute_get_multi_ticks_range(
     let db = State::builder().with_database(StateProviderDatabase::new(state)).build();
     let mut evm = evm_config.evm_with_env(db, evm_env);
     let ResultAndState { result, .. } = evm.transact_raw(tx_env)?;
-    let output = result
+    result
         .into_output()
-        .ok_or_else(|| eyre::eyre!("getMultiTicksRange call returned no output"))?;
-
-    Ok(IPoolState::getMultiTicksRangeCall::abi_decode_returns(&output)?)
+        .ok_or_else(|| eyre::eyre!("call returned no output"))
 }
 
 #[cfg(test)]
