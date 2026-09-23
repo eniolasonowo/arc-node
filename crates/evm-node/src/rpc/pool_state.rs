@@ -24,17 +24,12 @@
 
 use alloy_primitives::{b256, B256};
 use alloy_sol_types::sol;
-use jsonrpsee::{
-    core::RpcResult,
-    proc_macros::rpc,
-    PendingSubscriptionSink, SubscriptionMessage,
-};
+use jsonrpsee::{core::RpcResult, proc_macros::rpc, PendingSubscriptionSink, SubscriptionMessage};
 use tokio::sync::watch;
 
 /// UniswapV3 `Swap(address,address,int256,int256,uint160,uint128,int24)`.
-pub const TOPIC_UNISWAP_V3_SWAP: B256 = b256!(
-    "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
-);
+pub const TOPIC_UNISWAP_V3_SWAP: B256 =
+    b256!("0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
 
 /// PancakeV3 `Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick,uint128 protocolFeesToken0,uint128 protocolFeesToken1)`.
 pub const TOPIC_PANCAKE_V3_SWAP: B256 =

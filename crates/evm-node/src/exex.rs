@@ -507,6 +507,7 @@ fn execute_eth_call(
         // zero fees: no balance needed for the zeroed caller
         max_fee_per_gas: 0,
         max_priority_fee_per_gas: 0,
+        chain_id: evm_env.cfg_env.chain_id,
         ..Default::default()
     };
 
