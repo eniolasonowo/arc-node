@@ -34,7 +34,7 @@ use crate::rpc::pool_state::{
     TOPIC_V3_MINT, TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
 };
 use alloy_consensus::{BlockHeader as _, TxEip1559, TxReceipt as _};
-use alloy_primitives::{Address, Bytes, B256, Log, Signed, TxKind};
+use alloy_primitives::{Address, Bytes, B256, I256, Log, Signed, TxKind, U160};
 use alloy_sol_types::{SolCall, SolEvent};
 use futures::TryStreamExt;
 use arc_evm::ArcEvmConfig;
@@ -163,6 +163,41 @@ impl PoolStateConfig {
 struct Selection {
     tick: i32,
     is_swap: bool,
+    /// Swap market data (zero for liquidity-only pools).
+    sqrt_price_x96: U160,
+    liquidity: u128,
+    amount0: I256,
+    amount1: I256,
+}
+
+impl Selection {
+    fn swap(
+        tick: i32,
+        sqrt_price_x96: U160,
+        liquidity: u128,
+        amount0: I256,
+        amount1: I256,
+    ) -> Self {
+        Self {
+            tick,
+            is_swap: true,
+            sqrt_price_x96,
+            liquidity,
+            amount0,
+            amount1,
+        }
+    }
+
+    fn liquidity_event(tick: i32) -> Self {
+        Self {
+            tick,
+            is_swap: false,
+            sqrt_price_x96: U160::ZERO,
+            liquidity: 0,
+            amount0: I256::ZERO,
+            amount1: I256::ZERO,
+        }
+    }
 }
 
 /// Pool-state ExEx entry point.
@@ -282,6 +317,10 @@ fn process_chain<N>(
                             pool_id: format!("{pool:#x}"),
                             tick: sel.tick,
                             lp_fee: u32::try_from(info.lpFee).unwrap_or_default(),
+                            sqrtprice_x96: sel.sqrt_price_x96,
+                            liquidity: sel.liquidity,
+                            amount0: sel.amount0,
+                            amount1: sel.amount1,
                             range: info
                                 .range
                                 .iter()
@@ -335,6 +374,10 @@ fn process_chain<N>(
                             pool_id: format!("{pool_id:#x}"),
                             tick: sel.tick,
                             lp_fee: u32::try_from(info.lpFee).unwrap_or_default(),
+                            sqrtprice_x96: sel.sqrt_price_x96,
+                            liquidity: sel.liquidity,
+                            amount0: sel.amount0,
+                            amount1: sel.amount1,
                             range: info
                                 .range
                                 .iter()
@@ -396,8 +439,10 @@ fn process_log(
         return;
     }
 
-    let insert_swap = |selections: &mut BTreeMap<B256, Selection>, pool_id: B256, tick: i32| {
-        selections.insert(pool_id, Selection { tick, is_swap: true });
+    let insert_swap = |selections: &mut BTreeMap<B256, Selection>,
+                       pool_id: B256,
+                       sel: Selection| {
+        selections.insert(pool_id, sel);
     };
     let insert_liquidity =
         |selections: &mut BTreeMap<B256, Selection>, pool_id: B256, tick: i32| {
@@ -405,13 +450,13 @@ fn process_log(
                 // A swap always outranks liquidity events for the same pool.
                 Some(sel) if sel.is_swap => {}
                 _ => {
-                    selections.insert(pool_id, Selection { tick, is_swap: false });
+                    selections.insert(pool_id, Selection::liquidity_event(tick));
                 }
             }
         };
     let insert_v3_swap =
-        |selections: &mut BTreeMap<Address, Selection>, pool: Address, tick: i32| {
-            selections.insert(pool, Selection { tick, is_swap: true });
+        |selections: &mut BTreeMap<Address, Selection>, pool: Address, sel: Selection| {
+            selections.insert(pool, sel);
         };
     let insert_v3_liquidity =
         |selections: &mut BTreeMap<Address, Selection>, pool: Address, tick: i32| {
@@ -419,7 +464,7 @@ fn process_log(
                 // A swap always outranks liquidity events for the same pool.
                 Some(sel) if sel.is_swap => {}
                 _ => {
-                    selections.insert(pool, Selection { tick, is_swap: false });
+                    selections.insert(pool, Selection::liquidity_event(tick));
                 }
             }
         };
@@ -427,15 +472,33 @@ fn process_log(
     let to_i32 = |v: Signed<24, 1>| i32::try_from(v).unwrap_or_default();
     match topic0 {
         t if t == TOPIC_UNISWAP_V3_SWAP => match (cfg.contract_v3, v3_events::Swap::decode_log(log)) {
-            (Some(_), Ok(event)) => insert_v3_swap(selections_v3, log.address, to_i32(event.tick)),
+            (Some(_), Ok(event)) => insert_v3_swap(
+                selections_v3,
+                log.address,
+                Selection::swap(
+                    to_i32(event.tick),
+                    event.sqrtPriceX96,
+                    event.liquidity,
+                    event.amount0,
+                    event.amount1,
+                ),
+            ),
             (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Swap log"),
             (None, _) => {}
         },
         t if t == TOPIC_PANCAKE_V3_SWAP => {
             match (cfg.contract_v3, pancake_events::Swap::decode_log(log)) {
-                (Some(_), Ok(event)) => {
-                    insert_v3_swap(selections_v3, log.address, to_i32(event.tick))
-                }
+                (Some(_), Ok(event)) => insert_v3_swap(
+                    selections_v3,
+                    log.address,
+                    Selection::swap(
+                        to_i32(event.tick),
+                        event.sqrtPriceX96,
+                        event.liquidity,
+                        event.amount0,
+                        event.amount1,
+                    ),
+                ),
                 (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode pancake v3 Swap log"),
                 (None, _) => {}
             }
@@ -455,7 +518,17 @@ fn process_log(
             (None, _) => {}
         },
         t if t == TOPIC_V4_SWAP => match (cfg.contract_v4, v4_events::Swap::decode_log(log)) {
-            (Some(_), Ok(event)) => insert_swap(selections_v4, event.id, to_i32(event.tick)),
+            (Some(_), Ok(event)) => insert_swap(
+                selections_v4,
+                event.id,
+                Selection::swap(
+                    to_i32(event.tick),
+                    event.sqrtPriceX96,
+                    event.liquidity,
+                    I256::try_from(event.amount0).unwrap_or_default(),
+                    I256::try_from(event.amount1).unwrap_or_default(),
+                ),
+            ),
             (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v4 Swap log"),
             (None, _) => {}
         },
@@ -581,6 +654,47 @@ mod tests {
                 "default topic list missing {expected}"
             );
         }
+    }
+
+    /// Swap selections carry market data; liquidity-only selections default
+    /// to zeros; and a liquidity event never clobbers an earlier swap's data.
+    #[test]
+    fn selection_market_data_semantics() {
+        let sqrt = U160::from(1_234_567_890u64);
+        let amt0 = I256::try_from(-100_000_000i64).unwrap();
+        let amt1 = I256::try_from(500_000_000i64).unwrap();
+
+        let swap = Selection::swap(-887220, sqrt, 987_654u128, amt0, amt1);
+        assert!(swap.is_swap);
+        assert_eq!(swap.tick, -887220);
+        assert_eq!(swap.sqrt_price_x96, sqrt);
+        assert_eq!(swap.liquidity, 987_654);
+        assert_eq!(swap.amount0, amt0);
+        assert_eq!(swap.amount1, amt1);
+
+        let liq = Selection::liquidity_event(42);
+        assert!(!liq.is_swap);
+        assert_eq!(liq.sqrt_price_x96, U160::ZERO);
+        assert_eq!(liq.liquidity, 0);
+        assert_eq!(liq.amount0, I256::ZERO);
+        assert_eq!(liq.amount1, I256::ZERO);
+
+        // Same precedence rule as `insert_v3_liquidity`/`insert_liquidity`:
+        // a liquidity event must not overwrite an existing swap selection.
+        let mut pools: std::collections::BTreeMap<Address, Selection> =
+            std::collections::BTreeMap::new();
+        let pool = Address::repeat_byte(0xaa);
+        pools.insert(pool, swap);
+        match pools.get(&pool) {
+            Some(sel) if sel.is_swap => {}
+            _ => {
+                pools.insert(pool, liq);
+            }
+        }
+        let kept = &pools[&pool];
+        assert_eq!(kept.sqrt_price_x96, sqrt);
+        assert_eq!(kept.amount0, amt0);
+        assert_eq!(kept.amount1, amt1);
     }
 }
 

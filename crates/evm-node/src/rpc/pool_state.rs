@@ -22,7 +22,7 @@
 //! publishes the decoded response on a [`watch`] channel; this module serves
 //! it as `poolState_latest` and `poolState_subscribe`.
 
-use alloy_primitives::{b256, B256};
+use alloy_primitives::{b256, I256, U160, B256};
 use alloy_sol_types::sol;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, PendingSubscriptionSink, SubscriptionMessage};
 use tokio::sync::watch;
@@ -129,6 +129,13 @@ pub struct PoolStateEntry {
     pub tick: i32,
     /// Pool fee in hundredths of a bip.
     pub lp_fee: u32,
+
+    /// SqrtPriceX96
+    pub sqrtprice_x96: U160,
+    /// liquidity
+    pub liquidity: u128,
+    pub amount0: I256,
+    pub amount1: I256,
     /// Tick range around the trigger tick.
     pub range: Vec<TickRangeEntry>,
 }
