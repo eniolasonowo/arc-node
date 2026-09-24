@@ -301,6 +301,7 @@ fn process_chain<N>(
             })
             .collect();
 
+        let call_started = std::time::Instant::now();
         match execute_eth_call(
             evm_config,
             provider,
@@ -309,7 +310,16 @@ fn process_chain<N>(
             tip.header(),
             tip.hash(),
         ) {
-            Ok(output) => match IV3PoolState::getMultiTicksRangeCall::abi_decode_returns(&output)
+            Ok(output) => {
+                tracing::info!(
+                    target: "arc::exex::pool_state",
+                    family = "v3",
+                    block_number = tip.number(),
+                    pools = selections_v3.len(),
+                    elapsed_ms = call_started.elapsed().as_millis() as u64,
+                    "getMultiTicksRange call completed"
+                );
+                match IV3PoolState::getMultiTicksRangeCall::abi_decode_returns(&output)
             {
                 Ok(returns) => {
                     entries.extend(selections_v3.iter().zip(returns).map(|((pool, sel), info)| {
@@ -339,10 +349,13 @@ fn process_chain<N>(
                     error = %err,
                     "failed to decode v3 getMultiTicksRange output"
                 ),
-            },
+                }
+            }
             Err(err) => tracing::warn!(
                 target: "arc::exex::pool_state",
+                family = "v3",
                 block_number = tip.number(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
                 error = %err,
                 "v3 getMultiTicksRange call failed; keeping previous snapshot"
             ),
@@ -358,6 +371,7 @@ fn process_chain<N>(
             })
             .collect();
 
+        let call_started = std::time::Instant::now();
         match execute_eth_call(
             evm_config,
             provider,
@@ -366,7 +380,16 @@ fn process_chain<N>(
             tip.header(),
             tip.hash(),
         ) {
-            Ok(output) => match IV4PoolState::getMultiTicksRangeCall::abi_decode_returns(&output)
+            Ok(output) => {
+                tracing::info!(
+                    target: "arc::exex::pool_state",
+                    family = "v4",
+                    block_number = tip.number(),
+                    pools = selections_v4.len(),
+                    elapsed_ms = call_started.elapsed().as_millis() as u64,
+                    "getMultiTicksRange call completed"
+                );
+                match IV4PoolState::getMultiTicksRangeCall::abi_decode_returns(&output)
             {
                 Ok(returns) => {
                     entries.extend(selections_v4.iter().zip(returns).map(
@@ -396,10 +419,13 @@ fn process_chain<N>(
                     error = %err,
                     "failed to decode v4 getMultiTicksRange output"
                 ),
-            },
+                }
+            }
             Err(err) => tracing::warn!(
                 target: "arc::exex::pool_state",
+                family = "v4",
                 block_number = tip.number(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
                 error = %err,
                 "v4 getMultiTicksRange call failed; keeping previous snapshot"
             ),
