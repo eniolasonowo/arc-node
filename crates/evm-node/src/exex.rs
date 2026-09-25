@@ -29,19 +29,19 @@
 //!    [`watch`] channel served by the `poolState` RPC namespace.
 
 use crate::rpc::pool_state::{
-    default_topics, PoolStateEntry, PoolStateSnapshot, PoolStateWatch, TickRangeEntry,
-    IV3PoolState, IV4PoolState, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN,
-    TOPIC_V3_MINT, TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
+    default_topics, IV3PoolState, IV4PoolState, PoolStateEntry, PoolStateSnapshot, PoolStateWatch,
+    TickRangeEntry, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT,
+    TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
 };
 use alloy_consensus::{BlockHeader as _, TxEip1559, TxReceipt as _};
-use alloy_primitives::{Address, Bytes, B256, I256, Log, Signed, TxKind, U160};
+use alloy_primitives::{Address, Bytes, Log, Signed, TxKind, B256, I256, U160};
 use alloy_sol_types::{SolCall, SolEvent};
-use futures::TryStreamExt;
 use arc_evm::ArcEvmConfig;
+use futures::TryStreamExt;
+use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{ConfigureEvm, Evm as _, EvmFor};
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::{FullNodeComponents, NodeTypes};
-use reth_ethereum_primitives::EthPrimitives;
 use reth_primitives_traits::Recovered;
 use reth_provider::{Chain, StateProviderBox, StateProviderFactory};
 use reth_revm::{database::StateProviderDatabase, db::State};
@@ -234,15 +234,16 @@ where
                     &watch,
                 );
             }
-            ExExNotification::ChainReorged { new, .. } => {
+            ExExNotification::ChainReorged { .. } => {
+                // Arc chain has not reorg
                 // Recompute the snapshot from the new chain.
-                process_chain::<N>(
-                    new,
-                    &cfg,
-                    ctx.components.evm_config(),
-                    ctx.components.provider(),
-                    &watch,
-                );
+                // process_chain::<N>(
+                //     new,
+                //     &cfg,
+                //     ctx.components.evm_config(),
+                //     ctx.components.provider(),
+                //     &watch,
+                // );
             }
             ExExNotification::ChainReverted { .. } => {
                 // State will be refreshed by the next committed chain.
@@ -320,7 +321,9 @@ fn process_chain<N>(
             &mut call_evm,
             evm_config,
             contract,
-            IV3PoolState::getMultiTicksRangeCall { args }.abi_encode().into(),
+            IV3PoolState::getMultiTicksRangeCall { args }
+                .abi_encode()
+                .into(),
             chain_id,
         ) {
             Ok(output) => {
@@ -332,36 +335,37 @@ fn process_chain<N>(
                     elapsed_ms = call_started.elapsed().as_millis() as u64,
                     "getMultiTicksRange call completed"
                 );
-                match IV3PoolState::getMultiTicksRangeCall::abi_decode_returns(&output)
-            {
-                Ok(returns) => {
-                    entries.extend(selections_v3.iter().zip(returns).map(|((pool, sel), info)| {
-                        PoolStateEntry {
-                            pool_id: format!("{pool:#x}"),
-                            tick: sel.tick,
-                            lp_fee: u32::try_from(info.lpFee).unwrap_or_default(),
-                            sqrtprice_x96: sel.sqrt_price_x96,
-                            liquidity: sel.liquidity,
-                            amount0: sel.amount0,
-                            amount1: sel.amount1,
-                            range: info
-                                .range
-                                .iter()
-                                .map(|tick| TickRangeEntry {
-                                    tick_index: i32::try_from(tick.tickIndex)
-                                        .unwrap_or_default(),
-                                    liquidity_net: tick.liquidityNet.to_string(),
-                                })
-                                .collect(),
-                        }
-                    }));
-                }
-                Err(err) => tracing::warn!(
-                    target: "arc::exex::pool_state",
-                    block_number = tip.number(),
-                    error = %err,
-                    "failed to decode v3 getMultiTicksRange output"
-                ),
+                match IV3PoolState::getMultiTicksRangeCall::abi_decode_returns(&output) {
+                    Ok(returns) => {
+                        entries.extend(selections_v3.iter().zip(returns).map(
+                            |((pool, sel), info)| {
+                                PoolStateEntry {
+                                    pool_id: format!("{pool:#x}"),
+                                    tick: sel.tick,
+                                    lp_fee: u32::try_from(info.lpFee).unwrap_or_default(),
+                                    sqrtprice_x96: sel.sqrt_price_x96,
+                                    liquidity: sel.liquidity,
+                                    amount0: sel.amount0,
+                                    amount1: sel.amount1,
+                                    range: info
+                                        .range
+                                        .iter()
+                                        .map(|tick| TickRangeEntry {
+                                            tick_index: i32::try_from(tick.tickIndex)
+                                                .unwrap_or_default(),
+                                            liquidity_net: tick.liquidityNet.to_string(),
+                                        })
+                                        .collect(),
+                                }
+                            },
+                        ));
+                    }
+                    Err(err) => tracing::warn!(
+                        target: "arc::exex::pool_state",
+                        block_number = tip.number(),
+                        error = %err,
+                        "failed to decode v3 getMultiTicksRange output"
+                    ),
                 }
             }
             Err(err) => tracing::warn!(
@@ -389,7 +393,9 @@ fn process_chain<N>(
             &mut call_evm,
             evm_config,
             contract,
-            IV4PoolState::getMultiTicksRangeCall { args }.abi_encode().into(),
+            IV4PoolState::getMultiTicksRangeCall { args }
+                .abi_encode()
+                .into(),
             chain_id,
         ) {
             Ok(output) => {
@@ -401,36 +407,37 @@ fn process_chain<N>(
                     elapsed_ms = call_started.elapsed().as_millis() as u64,
                     "getMultiTicksRange call completed"
                 );
-                match IV4PoolState::getMultiTicksRangeCall::abi_decode_returns(&output)
-            {
-                Ok(returns) => {
-                    entries.extend(selections_v4.iter().zip(returns).map(
-                        |((pool_id, sel), info)| PoolStateEntry {
-                            pool_id: format!("{pool_id:#x}"),
-                            tick: sel.tick,
-                            lp_fee: u32::try_from(info.lpFee).unwrap_or_default(),
-                            sqrtprice_x96: sel.sqrt_price_x96,
-                            liquidity: sel.liquidity,
-                            amount0: sel.amount0,
-                            amount1: sel.amount1,
-                            range: info
-                                .range
-                                .iter()
-                                .map(|tick| TickRangeEntry {
-                                    tick_index: i32::try_from(tick.tickIndex)
-                                        .unwrap_or_default(),
-                                    liquidity_net: tick.liquidityNet.to_string(),
-                                })
-                                .collect(),
-                        },
-                    ));
-                }
-                Err(err) => tracing::warn!(
-                    target: "arc::exex::pool_state",
-                    block_number = tip.number(),
-                    error = %err,
-                    "failed to decode v4 getMultiTicksRange output"
-                ),
+                match IV4PoolState::getMultiTicksRangeCall::abi_decode_returns(&output) {
+                    Ok(returns) => {
+                        entries.extend(selections_v4.iter().zip(returns).map(
+                            |((pool_id, sel), info)| {
+                                PoolStateEntry {
+                                    pool_id: format!("{pool_id:#x}"),
+                                    tick: sel.tick,
+                                    lp_fee: u32::try_from(info.lpFee).unwrap_or_default(),
+                                    sqrtprice_x96: sel.sqrt_price_x96,
+                                    liquidity: sel.liquidity,
+                                    amount0: sel.amount0,
+                                    amount1: sel.amount1,
+                                    range: info
+                                        .range
+                                        .iter()
+                                        .map(|tick| TickRangeEntry {
+                                            tick_index: i32::try_from(tick.tickIndex)
+                                                .unwrap_or_default(),
+                                            liquidity_net: tick.liquidityNet.to_string(),
+                                        })
+                                        .collect(),
+                                }
+                            },
+                        ));
+                    }
+                    Err(err) => tracing::warn!(
+                        target: "arc::exex::pool_state",
+                        block_number = tip.number(),
+                        error = %err,
+                        "failed to decode v4 getMultiTicksRange output"
+                    ),
                 }
             }
             Err(err) => tracing::warn!(
@@ -472,16 +479,17 @@ fn process_log(
     selections_v3: &mut BTreeMap<Address, Selection>,
     selections_v4: &mut BTreeMap<B256, Selection>,
 ) {
-    let Some(&topic0) = log.topics().first() else { return };
+    let Some(&topic0) = log.topics().first() else {
+        return;
+    };
     if !cfg.topics.contains(&topic0) {
         return;
     }
 
-    let insert_swap = |selections: &mut BTreeMap<B256, Selection>,
-                       pool_id: B256,
-                       sel: Selection| {
-        selections.insert(pool_id, sel);
-    };
+    let insert_swap =
+        |selections: &mut BTreeMap<B256, Selection>, pool_id: B256, sel: Selection| {
+            selections.insert(pool_id, sel);
+        };
     let insert_liquidity =
         |selections: &mut BTreeMap<B256, Selection>, pool_id: B256, tick: i32| {
             match selections.get(&pool_id) {
@@ -509,21 +517,25 @@ fn process_log(
 
     let to_i32 = |v: Signed<24, 1>| i32::try_from(v).unwrap_or_default();
     match topic0 {
-        t if t == TOPIC_UNISWAP_V3_SWAP => match (cfg.contract_v3, v3_events::Swap::decode_log(log)) {
-            (Some(_), Ok(event)) => insert_v3_swap(
-                selections_v3,
-                log.address,
-                Selection::swap(
-                    to_i32(event.tick),
-                    event.sqrtPriceX96,
-                    event.liquidity,
-                    event.amount0,
-                    event.amount1,
+        t if t == TOPIC_UNISWAP_V3_SWAP => {
+            match (cfg.contract_v3, v3_events::Swap::decode_log(log)) {
+                (Some(_), Ok(event)) => insert_v3_swap(
+                    selections_v3,
+                    log.address,
+                    Selection::swap(
+                        to_i32(event.tick),
+                        event.sqrtPriceX96,
+                        event.liquidity,
+                        event.amount0,
+                        event.amount1,
+                    ),
                 ),
-            ),
-            (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Swap log"),
-            (None, _) => {}
-        },
+                (Some(_), Err(err)) => {
+                    tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Swap log")
+                }
+                (None, _) => {}
+            }
+        }
         t if t == TOPIC_PANCAKE_V3_SWAP => {
             match (cfg.contract_v3, pancake_events::Swap::decode_log(log)) {
                 (Some(_), Ok(event)) => insert_v3_swap(
@@ -537,7 +549,9 @@ fn process_log(
                         event.amount1,
                     ),
                 ),
-                (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode pancake v3 Swap log"),
+                (Some(_), Err(err)) => {
+                    tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode pancake v3 Swap log")
+                }
                 (None, _) => {}
             }
         }
@@ -545,14 +559,18 @@ fn process_log(
             (Some(_), Ok(event)) => {
                 insert_v3_liquidity(selections_v3, log.address, to_i32(event.tickLower))
             }
-            (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Mint log"),
+            (Some(_), Err(err)) => {
+                tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Mint log")
+            }
             (None, _) => {}
         },
         t if t == TOPIC_V3_BURN => match (cfg.contract_v3, v3_events::Burn::decode_log(log)) {
             (Some(_), Ok(event)) => {
                 insert_v3_liquidity(selections_v3, log.address, to_i32(event.tickLower))
             }
-            (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Burn log"),
+            (Some(_), Err(err)) => {
+                tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v3 Burn log")
+            }
             (None, _) => {}
         },
         t if t == TOPIC_V4_SWAP => match (cfg.contract_v4, v4_events::Swap::decode_log(log)) {
@@ -567,7 +585,9 @@ fn process_log(
                     I256::try_from(event.amount1).unwrap_or_default(),
                 ),
             ),
-            (Some(_), Err(err)) => tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v4 Swap log"),
+            (Some(_), Err(err)) => {
+                tracing::debug!(target: "arc::exex::pool_state", error = %err, "failed to decode v4 Swap log")
+            }
             (None, _) => {}
         },
         t if t == TOPIC_V4_MODIFY_LIQUIDITY => {
@@ -615,7 +635,9 @@ fn build_call_evm(
     evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
     let chain_id = evm_env.cfg_env.chain_id;
 
-    let db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+    let db = State::builder()
+        .with_database(StateProviderDatabase::new(state))
+        .build();
     Ok((evm_config.evm_with_env(db, evm_env), chain_id))
 }
 
@@ -751,10 +773,8 @@ mod tests {
     }
 }
 
-
 #[allow(dead_code)]
 fn probe_tx_env_conversion(evm_config: &ArcEvmConfig) {
     let tx = TxEip1559::default();
     let _unused = evm_config.tx_env(Recovered::new_unchecked(tx, Address::ZERO));
 }
-
