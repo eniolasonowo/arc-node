@@ -22,7 +22,7 @@
 //! publishes the decoded response on a [`watch`] channel; this module serves
 //! it as `poolState_latest` and `poolState_subscribe`.
 
-use alloy_primitives::{b256, I256, U160, B256};
+use alloy_primitives::{b256, B256, I256, U160};
 use alloy_sol_types::sol;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, PendingSubscriptionSink, SubscriptionMessage};
 use tokio::sync::watch;
@@ -148,6 +148,13 @@ pub struct PoolStateSnapshot {
     pub block_number: u64,
     /// Hash of the block the snapshot was computed at.
     pub block_hash: String,
+
+    /// Wall-clock nanoseconds since the Unix epoch, captured when the ExEx
+    /// began processing the notification that produced this snapshot.
+    pub timestamp: u128,
+    /// Base fee of the block the snapshot was computed at (0 if pre-London).
+    pub base_fee: u64,
+
     /// One entry per pool that had a matching event in the block.
     pub entries: Vec<PoolStateEntry>,
 }

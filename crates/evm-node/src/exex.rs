@@ -293,9 +293,9 @@ fn process_chain<N>(
     let tip = chain.tip();
     let mut entries: Vec<PoolStateEntry> = Vec::new();
 
-    let (mut call_evm, chain_id) =
+    let (mut call_evm, chain_id, base_fee) =
         match build_call_evm(evm_config, provider, tip.header(), tip.hash()) {
-            Ok((evm, chain_id)) => (evm, chain_id),
+            Ok((evm, chain_id, base_fee)) => (evm, chain_id, base_fee),
             Err(err) => {
                 tracing::warn!(
                     target: "arc::exex::pool_state",
@@ -306,6 +306,10 @@ fn process_chain<N>(
                 return;
             }
         };
+    let started_at_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
 
     if let (Some(contract), false) = (cfg.contract_v3, selections_v3.is_empty()) {
         let args: Vec<IV3PoolState::ITicksRangeArgs> = selections_v3
@@ -458,6 +462,8 @@ fn process_chain<N>(
     let snapshot = PoolStateSnapshot {
         block_number: tip.number(),
         block_hash: format!("{:#x}", tip.hash()),
+        timestamp: started_at_ns,
+        base_fee,
         entries,
     };
 
@@ -621,10 +627,14 @@ fn build_call_evm(
     provider: &(impl StateProviderFactory + Clone + Unpin + 'static),
     header: &alloy_consensus::Header,
     at: B256,
-) -> eyre::Result<(CallEvm, u64)> {
+) -> eyre::Result<(CallEvm, u64 /* chain_id */, u64 /* base_fee */)> {
     let state = provider.history_by_block_hash(at)?;
 
     let mut evm_env = evm_config.evm_env(header)?;
+
+    let chain_id = evm_env.cfg_env.chain_id;
+    // Captured before `disable_base_fee` relaxes the env below.
+    let base_fee = evm_env.block_env.basefee;
 
     // Same relaxations `prepare_call_env` applies for `eth_call`.
     evm_env.cfg_env.disable_nonce_check = true;
@@ -633,12 +643,9 @@ fn build_call_evm(
     evm_env.cfg_env.disable_block_gas_limit = true;
     evm_env.cfg_env.disable_fee_charge = true;
     evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
-    let chain_id = evm_env.cfg_env.chain_id;
 
-    let db = State::builder()
-        .with_database(StateProviderDatabase::new(state))
-        .build();
-    Ok((evm_config.evm_with_env(db, evm_env), chain_id))
+    let db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+    Ok((evm_config.evm_with_env(db, evm_env), chain_id, base_fee))
 }
 
 /// Executes an arbitrary call on the shared EVM: sender `0x0`, zero gas
