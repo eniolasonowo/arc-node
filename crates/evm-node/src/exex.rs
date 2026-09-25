@@ -38,12 +38,12 @@ use alloy_primitives::{Address, Bytes, B256, I256, Log, Signed, TxKind, U160};
 use alloy_sol_types::{SolCall, SolEvent};
 use futures::TryStreamExt;
 use arc_evm::ArcEvmConfig;
-use reth_evm::{ConfigureEvm, Evm as _};
+use reth_evm::{ConfigureEvm, Evm as _, EvmFor};
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_node_api::{FullNodeComponents, NodeTypes};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_primitives_traits::Recovered;
-use reth_provider::{Chain, StateProviderFactory};
+use reth_provider::{Chain, StateProviderBox, StateProviderFactory};
 use reth_revm::{database::StateProviderDatabase, db::State};
 use revm::context_interface::result::ResultAndState;
 use std::collections::BTreeMap;
@@ -292,6 +292,20 @@ fn process_chain<N>(
     let tip = chain.tip();
     let mut entries: Vec<PoolStateEntry> = Vec::new();
 
+    let (mut call_evm, chain_id) =
+        match build_call_evm(evm_config, provider, tip.header(), tip.hash()) {
+            Ok((evm, chain_id)) => (evm, chain_id),
+            Err(err) => {
+                tracing::warn!(
+                    target: "arc::exex::pool_state",
+                    block_number = tip.number(),
+                    error = %err,
+                    "failed to build call evm; keeping previous snapshot"
+                );
+                return;
+            }
+        };
+
     if let (Some(contract), false) = (cfg.contract_v3, selections_v3.is_empty()) {
         let args: Vec<IV3PoolState::ITicksRangeArgs> = selections_v3
             .iter()
@@ -302,13 +316,12 @@ fn process_chain<N>(
             .collect();
 
         let call_started = std::time::Instant::now();
-        match execute_eth_call(
+        match call_contract(
+            &mut call_evm,
             evm_config,
-            provider,
             contract,
             IV3PoolState::getMultiTicksRangeCall { args }.abi_encode().into(),
-            tip.header(),
-            tip.hash(),
+            chain_id,
         ) {
             Ok(output) => {
                 tracing::info!(
@@ -372,13 +385,12 @@ fn process_chain<N>(
             .collect();
 
         let call_started = std::time::Instant::now();
-        match execute_eth_call(
+        match call_contract(
+            &mut call_evm,
             evm_config,
-            provider,
             contract,
             IV4PoolState::getMultiTicksRangeCall { args }.abi_encode().into(),
-            tip.header(),
-            tip.hash(),
+            chain_id,
         ) {
             Ok(output) => {
                 tracing::info!(
@@ -575,18 +587,21 @@ fn process_log(
     }
 }
 
-/// Executes an arbitrary call against the state at the given block,
-/// in-process, mirroring reth's `eth_call` handling (see
-/// `prepare_call_env` in `rpc-eth-api/src/helpers/call.rs`): sender `0x0`,
-/// zero gas price, and the same cfg relaxations. Returns the raw output.
-fn execute_eth_call(
+/// The shared EVM instance used for the per-chain `getMultiTicksRange`
+/// calls: revm `State` over the tip's historical state provider.
+type CallEvm = EvmFor<ArcEvmConfig, State<StateProviderDatabase<StateProviderBox>>>;
+
+/// Builds the EVM instance shared by all of a chain's `getMultiTicksRange`
+/// calls, pinned to the state at the given block.
+///
+/// Mirrors reth's `eth_call` handling (see `prepare_call_env` in
+/// `rpc-eth-api/src/helpers/call.rs`): same cfg relaxations.
+fn build_call_evm(
     evm_config: &ArcEvmConfig,
     provider: &(impl StateProviderFactory + Clone + Unpin + 'static),
-    contract: Address,
-    calldata: Bytes,
     header: &alloy_consensus::Header,
     at: B256,
-) -> eyre::Result<Bytes> {
+) -> eyre::Result<(CallEvm, u64)> {
     let state = provider.history_by_block_hash(at)?;
 
     let mut evm_env = evm_config.evm_env(header)?;
@@ -598,7 +613,22 @@ fn execute_eth_call(
     evm_env.cfg_env.disable_block_gas_limit = true;
     evm_env.cfg_env.disable_fee_charge = true;
     evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+    let chain_id = evm_env.cfg_env.chain_id;
 
+    let db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+    Ok((evm_config.evm_with_env(db, evm_env), chain_id))
+}
+
+/// Executes an arbitrary call on the shared EVM: sender `0x0`, zero gas
+/// price, unlimited gas. The call may leave (no-op) state changes in the
+/// `State` overlay, which is fine for view contracts. Returns the raw output.
+fn call_contract(
+    evm: &mut CallEvm,
+    evm_config: &ArcEvmConfig,
+    contract: Address,
+    calldata: Bytes,
+    chain_id: u64,
+) -> eyre::Result<Bytes> {
     let tx = TxEip1559 {
         gas_limit: u64::MAX,
         to: TxKind::Call(contract),
@@ -606,14 +636,11 @@ fn execute_eth_call(
         // zero fees: no balance needed for the zeroed caller
         max_fee_per_gas: 0,
         max_priority_fee_per_gas: 0,
-        chain_id: evm_env.cfg_env.chain_id,
+        chain_id,
         ..Default::default()
     };
 
     let tx_env = evm_config.tx_env(Recovered::new_unchecked(tx, Address::ZERO));
-
-    let db = State::builder().with_database(StateProviderDatabase::new(state)).build();
-    let mut evm = evm_config.evm_with_env(db, evm_env);
     let ResultAndState { result, .. } = evm.transact_raw(tx_env)?;
     result
         .into_output()
