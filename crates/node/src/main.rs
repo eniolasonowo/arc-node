@@ -186,6 +186,15 @@ struct ArcExtraCli {
     )]
     exex_pool_state_v4_contract: Option<alloy_primitives::Address>,
 
+    /// V4-family contract exposing getMultiRatesArc (bytes32-keyed pools).
+    #[arg(
+        long = "exex.pool-state.v4-rates-contract",
+        value_name = "ADDRESS",
+        requires = "exex_pool_state",
+        help_heading = "Arc ExEx"
+    )]
+    exex_pool_state_v4_rates_contract: Option<alloy_primitives::Address>,
+
     /// Topic0 filter for the pool-state ExEx; defaults to the standard
     /// V3/PancakeV3 Swap, Mint, Burn and V4 Swap, ModifyLiquidity topics.
     #[arg(
@@ -621,6 +630,7 @@ fn main() {
                 Some(arc_evm_node::exex::PoolStateConfig::new(
                     contract_v3,
                     contract_v4,
+                    ext.exex_pool_state_v4_rates_contract,
                     ext.exex_pool_state_topics.clone(),
                 ))
             } else {

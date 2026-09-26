@@ -24,14 +24,15 @@
 //!    events; otherwise the last `Mint`/`Burn`/`ModifyLiquidity` `tickLower`.
 //!    V3 pool addresses are left-padded into the `bytes32` pool id space.
 //! 3. Batches all selected pools into a single `getMultiTicksRange` `eth_call`
-//!    pinned to the new chain tip (via the node's loopback RPC).
-//! 4. Publishes the decoded response as a [`PoolStateSnapshot`] on a
+//!    pinned to the new chain tip, and — when a V4 rates contract is
+//!    configured — a second `getMultiRatesArc` `eth_call` for the V4 pools.
+//! 4. Publishes the decoded responses as a [`PoolStateSnapshot`] on a
 //!    [`watch`] channel served by the `poolState` RPC namespace.
 
 use crate::rpc::pool_state::{
-    default_topics, IV3PoolState, IV4PoolState, PoolStateEntry, PoolStateSnapshot, PoolStateWatch,
-    TickRangeEntry, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT,
-    TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
+    default_topics, IV3PoolState, IV4PoolState, IV4Rates, PoolRatesEntry, PoolStateEntry,
+    PoolStateSnapshot, PoolStateWatch, TickRangeEntry, TOPIC_PANCAKE_V3_SWAP,
+    TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT, TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
 };
 use alloy_consensus::{BlockHeader as _, TxEip1559, TxReceipt as _};
 use alloy_primitives::{Address, Bytes, Log, Signed, TxKind, B256, I256, U160};
@@ -138,6 +139,8 @@ pub struct PoolStateConfig {
     pub contract_v3: Option<Address>,
     /// V4-family contract exposing `getMultiTicksRange` (bytes32-keyed pools).
     pub contract_v4: Option<Address>,
+    /// V4-family contract exposing `getMultiRatesArc` (bytes32-keyed pools).
+    pub contract_v4_rates: Option<Address>,
     /// Topic0 filter; defaults to [`default_topics`].
     pub topics: Vec<B256>,
 }
@@ -148,11 +151,13 @@ impl PoolStateConfig {
     pub fn new(
         contract_v3: Option<Address>,
         contract_v4: Option<Address>,
+        contract_v4_rates: Option<Address>,
         topics: Option<Vec<B256>>,
     ) -> Self {
         Self {
             contract_v3,
             contract_v4,
+            contract_v4_rates,
             topics: topics.unwrap_or_else(default_topics),
         }
     }
@@ -455,7 +460,64 @@ fn process_chain<N>(
         }
     }
 
-    if entries.is_empty() {
+    // Rates call for the V4 pools; independent of the ticks call outcome.
+    let mut rates: Vec<PoolRatesEntry> = Vec::new();
+    if let (Some(rates_contract), false) = (cfg.contract_v4_rates, selections_v4.is_empty()) {
+        let pool_ids: Vec<B256> = selections_v4.keys().copied().collect();
+
+        let call_started = std::time::Instant::now();
+        match call_contract(
+            &mut call_evm,
+            evm_config,
+            rates_contract,
+            IV4Rates::getMultiRatesArcCall { poolIds: pool_ids }
+                .abi_encode()
+                .into(),
+            chain_id,
+        ) {
+            Ok(output) => {
+                tracing::info!(
+                    target: "arc::exex::pool_state",
+                    family = "v4",
+                    call = "getMultiRatesArc",
+                    block_number = tip.number(),
+                    pools = selections_v4.len(),
+                    elapsed_ms = call_started.elapsed().as_millis() as u64,
+                    "getMultiRatesArc call completed"
+                );
+                match IV4Rates::getMultiRatesArcCall::abi_decode_returns(&output) {
+                    Ok(returns) => {
+                        rates.extend(returns.iter().map(|r| PoolRatesEntry {
+                            pool_id: format!("{:#x}", r.poolId),
+                            rate0_in: r.rate0In.to_string(),
+                            delta0: r.delta0.to_string(),
+                            rate1_in: r.rate1In.to_string(),
+                            delta1: r.delta1.to_string(),
+                            rates0_out: r.rates0Out.iter().map(|v| v.to_string()).collect(),
+                            rates1_out: r.rates1Out.iter().map(|v| v.to_string()).collect(),
+                        }));
+                    }
+                    Err(err) => tracing::warn!(
+                        target: "arc::exex::pool_state",
+                        family = "v4",
+                        block_number = tip.number(),
+                        error = %err,
+                        "failed to decode v4 getMultiRatesArc output; publishing ticks without rates"
+                    ),
+                }
+            }
+            Err(err) => tracing::warn!(
+                target: "arc::exex::pool_state",
+                family = "v4",
+                block_number = tip.number(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
+                error = %err,
+                "v4 getMultiRatesArc call failed; publishing ticks without rates"
+            ),
+        }
+    }
+
+    if entries.is_empty() && rates.is_empty() {
         return;
     }
 
@@ -465,6 +527,7 @@ fn process_chain<N>(
         timestamp: started_at_ns,
         base_fee,
         entries,
+        rates,
     };
 
     tracing::debug!(

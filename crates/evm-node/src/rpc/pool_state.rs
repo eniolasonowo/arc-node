@@ -109,6 +109,25 @@ sol! {
     }
 }
 
+// V4-family rates contract: pools are identified by bytes32 id.
+sol! {
+    #[derive(Debug)]
+    interface IV4Rates {
+        struct Rates {
+            bytes32 poolId;
+            uint256 rate0In;
+            uint256 delta0;
+            uint256 rate1In;
+            uint256 delta1;
+            uint256[] rates0Out;
+            uint256[] rates1Out;
+        }
+        function getMultiRatesArc(bytes32[] memory poolIds)
+            public
+            returns (Rates[] memory rates);
+    }
+}
+
 /// One tick entry of a pool's range.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,6 +159,26 @@ pub struct PoolStateEntry {
     pub range: Vec<TickRangeEntry>,
 }
 
+/// Per-pool rates from `getMultiRatesArc`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolRatesEntry {
+    /// V4 raw `bytes32` pool id.
+    pub pool_id: String,
+    /// Input rate for token0, decimal string (uint256).
+    pub rate0_in: String,
+    /// Delta for token0, decimal string (uint256).
+    pub delta0: String,
+    /// Input rate for token1, decimal string (uint256).
+    pub rate1_in: String,
+    /// Delta for token1, decimal string (uint256).
+    pub delta1: String,
+    /// Output rates for token0, decimal strings (uint256).
+    pub rates0_out: Vec<String>,
+    /// Output rates for token1, decimal strings (uint256).
+    pub rates1_out: Vec<String>,
+}
+
 /// Latest pool-state snapshot published by the ExEx for one block.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -157,6 +196,9 @@ pub struct PoolStateSnapshot {
 
     /// One entry per pool that had a matching event in the block.
     pub entries: Vec<PoolStateEntry>,
+    /// One entry per V4 pool with a configured rates contract; empty if the
+    /// rates contract is not configured or the call failed.
+    pub rates: Vec<PoolRatesEntry>,
 }
 
 /// Watch channel used to publish snapshots from the ExEx to the RPC layer.
