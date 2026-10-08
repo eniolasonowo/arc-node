@@ -20,4 +20,5 @@ pub mod arc;
 pub mod common;
 pub mod get_certificate;
 pub mod get_version;
+pub mod lending;
 pub mod pool_state;

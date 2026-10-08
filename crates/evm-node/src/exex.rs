@@ -29,10 +29,15 @@
 //! 4. Publishes the decoded responses as a [`PoolStateSnapshot`] on a
 //!    [`watch`] channel served by the `poolState` RPC namespace.
 
+use crate::rpc::lending::{
+    ILendingBlockUpdate, TOPIC_LENDING_BORROW, TOPIC_LENDING_REPAY, TOPIC_LENDING_SUPPLY,
+    TOPIC_LENDING_SUPPLY_COLLATERAL, TOPIC_LENDING_WITHDRAW, TOPIC_LENDING_WITHDRAW_COLLATERAL,
+};
 use crate::rpc::pool_state::{
-    default_topics, IV3PoolState, IV4PoolState, IV4Rates, PoolRatesEntry, PoolStateEntry,
-    PoolStateSnapshot, PoolStateWatch, TickRangeEntry, TOPIC_PANCAKE_V3_SWAP,
-    TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT, TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
+    default_topics, IV3PoolState, IV4PoolState, IV4Rates, LendingBlockUpdateData,
+    MarketDetailEntry, PoolRatesEntry, PoolStateEntry, PoolStateSnapshot, PoolStateWatch,
+    TickRangeEntry, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT,
+    TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP, UserPositionEntry,
 };
 use alloy_consensus::{BlockHeader as _, TxEip1559, TxReceipt as _};
 use alloy_primitives::{Address, Bytes, Log, Signed, TxKind, B256, I256, U160};
@@ -47,7 +52,7 @@ use reth_primitives_traits::Recovered;
 use reth_provider::{Chain, StateProviderBox, StateProviderFactory};
 use reth_revm::{database::StateProviderDatabase, db::State};
 use revm::context_interface::result::ResultAndState;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// V3-family event bindings (UniswapV3 / PancakeV3 share signatures).
 mod v3_events {
@@ -132,6 +137,66 @@ mod v4_events {
     }
 }
 
+/// Lending (Morpho-family) event bindings.
+pub(crate) mod lending_events {
+    alloy_sol_types::sol! {
+        #[derive(Debug)]
+        event Supply(
+            bytes32 indexed id,
+            address indexed caller,
+            address indexed onBehalf,
+            uint256 assets,
+            uint256 shares
+        );
+
+        #[derive(Debug)]
+        event Withdraw(
+            bytes32 indexed id,
+            address caller,
+            address indexed onBehalf,
+            address indexed receiver,
+            uint256 assets,
+            uint256 shares
+        );
+
+        #[derive(Debug)]
+        event Borrow(
+            bytes32 indexed id,
+            address caller,
+            address indexed onBehalf,
+            address indexed receiver,
+            uint256 assets,
+            uint256 shares
+        );
+
+        #[derive(Debug)]
+        event Repay(
+            bytes32 indexed id,
+            address indexed caller,
+            address indexed onBehalf,
+            uint256 assets,
+            uint256 shares
+        );
+
+        #[derive(Debug)]
+        event SupplyCollateral(
+            bytes32 indexed id,
+            address indexed caller,
+            address indexed onBehalf,
+            uint256 assets
+        );
+
+        #[derive(Debug)]
+        event WithdrawCollateral(
+            bytes32 indexed id,
+            address caller,
+            address indexed onBehalf,
+            address indexed receiver,
+            uint256 assets
+        );
+    }
+}
+
 /// Pool-state ExEx configuration.
 #[derive(Debug, Clone)]
 pub struct PoolStateConfig {
@@ -141,6 +206,8 @@ pub struct PoolStateConfig {
     pub contract_v4: Option<Address>,
     /// V4-family contract exposing `getMultiRatesArc` (bytes32-keyed pools).
     pub contract_v4_rates: Option<Address>,
+    /// Lending contract exposing `blockUpdate` (bytes32-keyed markets).
+    pub contract_lending: Option<Address>,
     /// Topic0 filter; defaults to [`default_topics`].
     pub topics: Vec<B256>,
 }
@@ -152,12 +219,14 @@ impl PoolStateConfig {
         contract_v3: Option<Address>,
         contract_v4: Option<Address>,
         contract_v4_rates: Option<Address>,
+        contract_lending: Option<Address>,
         topics: Option<Vec<B256>>,
     ) -> Self {
         Self {
             contract_v3,
             contract_v4,
             contract_v4_rates,
+            contract_lending,
             topics: topics.unwrap_or_else(default_topics),
         }
     }
@@ -224,6 +293,7 @@ where
         target: "arc::exex::pool_state",
         contract_v3 = ?cfg.contract_v3,
         contract_v4 = ?cfg.contract_v4,
+        contract_lending = ?cfg.contract_lending,
         topics = cfg.topics.len(),
         "pool-state ExEx started"
     );
@@ -280,6 +350,10 @@ fn process_chain<N>(
     // not tracked at all.
     let mut selections_v3: BTreeMap<Address, Selection> = BTreeMap::new();
     let mut selections_v4: BTreeMap<B256, Selection> = BTreeMap::new();
+    // Lending-family selections: unique market ids and unique `onBehalf`
+    // users; not tracked without a configured lending contract.
+    let mut lending_ids: BTreeSet<B256> = BTreeSet::new();
+    let mut lending_users: BTreeSet<Address> = BTreeSet::new();
     for block in chain.blocks_iter() {
         let Some(receipts) = chain.receipts_by_block_hash(block.hash()) else {
             continue;
@@ -287,11 +361,53 @@ fn process_chain<N>(
         for receipt in receipts {
             for log in receipt.logs() {
                 process_log(log, cfg, &mut selections_v3, &mut selections_v4);
+                process_lending_log(log, cfg, &mut lending_ids, &mut lending_users);
             }
         }
     }
 
+    // Lending block-update call: independent of the pool ticks/rates calls,
+    // and must run even when no pool events matched.
+    let lending_data = if cfg.contract_lending.is_some()
+        && (!lending_ids.is_empty() || !lending_users.is_empty())
+    {
+        process_lending_block_update::<N>(
+            chain,
+            cfg,
+            evm_config,
+            provider,
+            &lending_ids,
+            &lending_users,
+        )
+    } else {
+        LendingBlockUpdateData::default()
+    };
+
     if selections_v3.is_empty() && selections_v4.is_empty() {
+        if lending_data.market_details.is_empty() && lending_data.positions.is_empty() {
+            return;
+        }
+        // Lending-only block: publish the snapshot with empty pool entries.
+        let tip = chain.tip();
+        let snapshot = PoolStateSnapshot {
+            block_number: tip.number(),
+            block_hash: format!("{:#x}", tip.hash()),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default(),
+            base_fee: tip.header().base_fee_per_gas().unwrap_or_default(),
+            entries: Vec::new(),
+            rates: Vec::new(),
+            lending: lending_data,
+        };
+        tracing::debug!(
+            target: "arc::exex::pool_state",
+            block_number = snapshot.block_number,
+            markets = snapshot.lending.market_details.len(),
+            "published lending-only pool-state snapshot"
+        );
+        watch.send_replace(snapshot);
         return;
     }
 
@@ -517,7 +633,7 @@ fn process_chain<N>(
         }
     }
 
-    if entries.is_empty() && rates.is_empty() {
+    if entries.is_empty() && rates.is_empty() && lending_data.is_empty() {
         return;
     }
 
@@ -528,6 +644,7 @@ fn process_chain<N>(
         base_fee,
         entries,
         rates,
+        lending: lending_data,
     };
 
     tracing::debug!(
@@ -673,6 +790,177 @@ fn process_log(
             }
         }
         _ => {}
+    }
+}
+
+/// Applies one log to the lending id/user sets. Market ids are keyed by the
+/// events' indexed `id`; users by the indexed `onBehalf` (independent lists
+/// for the `blockUpdate` call). No-op without a configured lending contract.
+fn process_lending_log(
+    log: &Log,
+    cfg: &PoolStateConfig,
+    lending_ids: &mut BTreeSet<B256>,
+    lending_users: &mut BTreeSet<Address>,
+) {
+    let Some(&topic0) = log.topics().first() else {
+        return;
+    };
+    if cfg.contract_lending.is_none() {
+        return;
+    }
+
+    let mut record = |id: B256, on_behalf: Address| {
+        lending_ids.insert(id);
+        lending_users.insert(on_behalf);
+    };
+
+    match topic0 {
+        t if t == TOPIC_LENDING_SUPPLY => {
+            if let Ok(event) = lending_events::Supply::decode_log(log) {
+                record(event.id, event.onBehalf);
+            }
+        }
+        t if t == TOPIC_LENDING_WITHDRAW => {
+            if let Ok(event) = lending_events::Withdraw::decode_log(log) {
+                record(event.id, event.onBehalf);
+            }
+        }
+        t if t == TOPIC_LENDING_BORROW => {
+            if let Ok(event) = lending_events::Borrow::decode_log(log) {
+                record(event.id, event.onBehalf);
+            }
+        }
+        t if t == TOPIC_LENDING_REPAY => {
+            if let Ok(event) = lending_events::Repay::decode_log(log) {
+                record(event.id, event.onBehalf);
+            }
+        }
+        t if t == TOPIC_LENDING_SUPPLY_COLLATERAL => {
+            if let Ok(event) = lending_events::SupplyCollateral::decode_log(log) {
+                record(event.id, event.onBehalf);
+            }
+        }
+        t if t == TOPIC_LENDING_WITHDRAW_COLLATERAL => {
+            if let Ok(event) = lending_events::WithdrawCollateral::decode_log(log) {
+                record(event.id, event.onBehalf);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Batches the selected ids/users into a single `blockUpdate` call pinned to
+/// the new chain tip; returns the decoded data, or default on failure.
+#[allow(clippy::too_many_arguments)]
+fn process_lending_block_update<N>(
+    chain: &Chain<<N::Types as NodeTypes>::Primitives>,
+    cfg: &PoolStateConfig,
+    evm_config: &N::Evm,
+    provider: &N::Provider,
+    lending_ids: &BTreeSet<B256>,
+    lending_users: &BTreeSet<Address>,
+) -> LendingBlockUpdateData
+where
+    N: FullNodeComponents<Evm = ArcEvmConfig, Types: NodeTypes<Primitives = EthPrimitives>>,
+{
+    let Some(contract) = cfg.contract_lending else {
+        return LendingBlockUpdateData::default();
+    };
+    let tip = chain.tip();
+
+    let (mut call_evm, chain_id, _base_fee) =
+        match build_call_evm(evm_config, provider, tip.header(), tip.hash()) {
+            Ok(built) => built,
+            Err(err) => {
+                tracing::warn!(
+                    target: "arc::exex::pool_state",
+                    block_number = tip.number(),
+                    error = %err,
+                    "failed to build call evm; skipping lending block update"
+                );
+                return LendingBlockUpdateData::default();
+            }
+        };
+
+    let ids: Vec<B256> = lending_ids.iter().copied().collect();
+    let users: Vec<Address> = lending_users.iter().copied().collect();
+    let call_started = std::time::Instant::now();
+    match call_contract(
+        &mut call_evm,
+        evm_config,
+        contract,
+        ILendingBlockUpdate::blockUpdateCall { ids, users }
+            .abi_encode()
+            .into(),
+        chain_id,
+    ) {
+        Ok(output) => {
+            tracing::info!(
+                target: "arc::exex::pool_state",
+                family = "lending",
+                call = "blockUpdate",
+                block_number = tip.number(),
+                ids = lending_ids.len(),
+                users = lending_users.len(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
+                "blockUpdate call completed"
+            );
+            match ILendingBlockUpdate::blockUpdateCall::abi_decode_returns(&output) {
+                Ok(update) => LendingBlockUpdateData {
+                    market_details: update
+                        .marketDetails
+                        .iter()
+                        .map(|m| MarketDetailEntry {
+                            id: format!("{:#x}", m.id),
+                            total_supply_assets: m.totalSupplyAssets.to_string(),
+                            total_supply_shares: m.totalSupplyShares.to_string(),
+                            total_borrow_assets: m.totalBorrowAssets.to_string(),
+                            total_borrow_shares: m.totalBorrowShares.to_string(),
+                            last_update: m.lastUpdate.to_string(),
+                            fee: m.fee.to_string(),
+                            loan_token: format!("{:#x}", m.loanToken),
+                            collateral_token: format!("{:#x}", m.collateralToken),
+                            oracle: format!("{:#x}", m.oracle),
+                            irm: format!("{:#x}", m.irm),
+                            lltv: m.lltv.to_string(),
+                            borrow_rate: m.borrowRate.to_string(),
+                            price: m.price.to_string(),
+                        })
+                        .collect(),
+                    positions: update
+                        .positions
+                        .iter()
+                        .map(|p| UserPositionEntry {
+                            id: format!("{:#x}", p.id),
+                            user: format!("{:#x}", p.user),
+                            supply_shares: p.supplyShares.to_string(),
+                            borrow_shares: p.borrowShares.to_string(),
+                            collateral: p.collateral.to_string(),
+                        })
+                        .collect(),
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        target: "arc::exex::pool_state",
+                        block_number = tip.number(),
+                        error = %err,
+                        "failed to decode blockUpdate output; publishing pools without lending data"
+                    );
+                    LendingBlockUpdateData::default()
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "arc::exex::pool_state",
+                family = "lending",
+                block_number = tip.number(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
+                error = %err,
+                "blockUpdate call failed; publishing pools without lending data"
+            );
+            LendingBlockUpdateData::default()
+        }
     }
 }
 

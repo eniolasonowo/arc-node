@@ -195,6 +195,15 @@ struct ArcExtraCli {
     )]
     exex_pool_state_v4_rates_contract: Option<alloy_primitives::Address>,
 
+    /// Lending contract exposing blockUpdate (bytes32-keyed markets).
+    #[arg(
+        long = "exex.pool-state.lending-contract",
+        value_name = "ADDRESS",
+        requires = "exex_pool_state",
+        help_heading = "Arc ExEx"
+    )]
+    exex_pool_state_lending_contract: Option<alloy_primitives::Address>,
+
     /// Topic0 filter for the pool-state ExEx; defaults to the standard
     /// V3/PancakeV3 Swap, Mint, Burn and V4 Swap, ModifyLiquidity topics.
     #[arg(
@@ -631,6 +640,7 @@ fn main() {
                     contract_v3,
                     contract_v4,
                     ext.exex_pool_state_v4_rates_contract,
+                    ext.exex_pool_state_lending_contract,
                     ext.exex_pool_state_topics.clone(),
                 ))
             } else {

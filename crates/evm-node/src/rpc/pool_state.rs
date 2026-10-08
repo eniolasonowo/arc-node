@@ -179,6 +179,73 @@ pub struct PoolRatesEntry {
     pub rates1_out: Vec<String>,
 }
 
+/// One user position of a lending market.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserPositionEntry {
+    /// Morpho market id (raw `bytes32`).
+    pub id: String,
+    /// Owner of the position.
+    pub user: String,
+    /// Supply shares, decimal string (uint256).
+    pub supply_shares: String,
+    /// Borrow shares, decimal string (uint128).
+    pub borrow_shares: String,
+    /// Collateral, decimal string (uint128).
+    pub collateral: String,
+}
+
+/// Per-market detail returned by `blockUpdate`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDetailEntry {
+    /// Morpho market id (raw `bytes32`).
+    pub id: String,
+    /// Total supply assets, decimal string (uint128).
+    pub total_supply_assets: String,
+    /// Total supply shares, decimal string (uint128).
+    pub total_supply_shares: String,
+    /// Total borrow assets, decimal string (uint128).
+    pub total_borrow_assets: String,
+    /// Total borrow shares, decimal string (uint128).
+    pub total_borrow_shares: String,
+    /// Last accrual timestamp, decimal string (uint128).
+    pub last_update: String,
+    /// Market fee, decimal string (uint128).
+    pub fee: String,
+    /// Loan token.
+    pub loan_token: String,
+    /// Collateral token.
+    pub collateral_token: String,
+    /// Oracle.
+    pub oracle: String,
+    /// Interest rate model.
+    pub irm: String,
+    /// Liquidation LTV, decimal string (uint256).
+    pub lltv: String,
+    /// IRM borrow rate, decimal string (uint256).
+    pub borrow_rate: String,
+    /// Oracle price, decimal string (uint256).
+    pub price: String,
+}
+
+/// Lending data from `blockUpdate`, nested in the pool-state snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LendingBlockUpdateData {
+    /// Market details for the ids seen in the block's lending events.
+    pub market_details: Vec<MarketDetailEntry>,
+    /// Positions for the `onBehalf` users seen in the block's lending events.
+    pub positions: Vec<UserPositionEntry>,
+}
+
+impl LendingBlockUpdateData {
+    /// True when neither market details nor positions were produced.
+    pub fn is_empty(&self) -> bool {
+        self.market_details.is_empty() && self.positions.is_empty()
+    }
+}
+
 /// Latest pool-state snapshot published by the ExEx for one block.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -199,6 +266,9 @@ pub struct PoolStateSnapshot {
     /// One entry per V4 pool with a configured rates contract; empty if the
     /// rates contract is not configured or the call failed.
     pub rates: Vec<PoolRatesEntry>,
+    /// Lending data from `blockUpdate`; empty if the lending contract is
+    /// not configured or the call failed.
+    pub lending: LendingBlockUpdateData,
 }
 
 /// Watch channel used to publish snapshots from the ExEx to the RPC layer.
