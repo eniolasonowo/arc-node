@@ -36,8 +36,8 @@ use crate::rpc::lending::{
 use crate::rpc::pool_state::{
     default_topics, IV3PoolState, IV4PoolState, IV4Rates, LendingBlockUpdateData,
     MarketDetailEntry, PoolRatesEntry, PoolStateEntry, PoolStateSnapshot, PoolStateWatch,
-    TickRangeEntry, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT,
-    TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP, UserPositionEntry,
+    TickRangeEntry, UserPositionEntry, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN,
+    TOPIC_V3_MINT, TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
 };
 use alloy_consensus::{BlockHeader as _, TxEip1559, TxReceipt as _};
 use alloy_primitives::{Address, Bytes, Log, Signed, TxKind, B256, I256, U160};
@@ -366,11 +366,12 @@ fn process_chain<N>(
         }
     }
 
-    // Lending block-update call: independent of the pool ticks/rates calls,
-    // and must run even when no pool events matched.
-    let lending_data = if cfg.contract_lending.is_some()
-        && (!lending_ids.is_empty() || !lending_users.is_empty())
-    {
+    // Lending block-update call: independent of the pool ticks/rates calls.
+    // Runs on every committed block — the contract returns market details
+    // even when no lending events matched (empty ids/users); the ids/users
+    // gathered from the block's events enrich the call with the positions
+    // actually touched by that block.
+    let lending_data = if cfg.contract_lending.is_some() {
         process_lending_block_update::<N>(
             chain,
             cfg,
@@ -851,6 +852,10 @@ fn process_lending_log(
 
 /// Batches the selected ids/users into a single `blockUpdate` call pinned to
 /// the new chain tip; returns the decoded data, or default on failure.
+///
+/// Called on every committed block when the lending contract is configured:
+/// the contract returns market details even for empty ids/users, so the
+/// snapshot stays fresh block-to-block regardless of lending activity.
 #[allow(clippy::too_many_arguments)]
 fn process_lending_block_update<N>(
     chain: &Chain<<N::Types as NodeTypes>::Primitives>,
@@ -995,7 +1000,9 @@ fn build_call_evm(
     evm_env.cfg_env.disable_fee_charge = true;
     evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
 
-    let db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+    let db = State::builder()
+        .with_database(StateProviderDatabase::new(state))
+        .build();
     Ok((evm_config.evm_with_env(db, evm_env), chain_id, base_fee))
 }
 
