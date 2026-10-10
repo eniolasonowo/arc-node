@@ -34,8 +34,8 @@ use crate::rpc::lending::{
     TOPIC_LENDING_SUPPLY_COLLATERAL, TOPIC_LENDING_WITHDRAW, TOPIC_LENDING_WITHDRAW_COLLATERAL,
 };
 use crate::rpc::pool_state::{
-    default_topics, IV3PoolState, IV4PoolState, IV4Rates, LendingBlockUpdateData,
-    MarketDetailEntry, PoolRatesEntry, PoolStateEntry, PoolStateSnapshot, PoolStateWatch,
+    default_topics, IV3PoolState, IV4PoolState, IV4Rates, LendingBlockUpdateData, MarketDetailEntry,
+    PoolRatesEntry, PoolStateEntry, PoolStateSnapshot, PoolStateWatch, RatesPoolRegistry,
     TickRangeEntry, UserPositionEntry, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN,
     TOPIC_V3_MINT, TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
 };
@@ -279,6 +279,7 @@ pub async fn pool_state_exex<N>(
     mut ctx: ExExContext<N>,
     cfg: PoolStateConfig,
     watch: PoolStateWatch,
+    rates_pools: RatesPoolRegistry,
 ) -> eyre::Result<()>
 where
     N: FullNodeComponents<
@@ -307,6 +308,7 @@ where
                     ctx.components.evm_config(),
                     ctx.components.provider(),
                     &watch,
+                    &rates_pools,
                 );
             }
             ExExNotification::ChainReorged { .. } => {
@@ -343,6 +345,7 @@ fn process_chain<N>(
     evm_config: &N::Evm,
     provider: &N::Provider,
     watch: &PoolStateWatch,
+    rates_pools: &RatesPoolRegistry,
 ) where
     N: FullNodeComponents<Evm = ArcEvmConfig, Types: NodeTypes<Primitives = EthPrimitives>>,
 {
@@ -579,15 +582,26 @@ fn process_chain<N>(
 
     // Rates call for the V4 pools; independent of the ticks call outcome.
     let mut rates: Vec<PoolRatesEntry> = Vec::new();
-    if let (Some(rates_contract), false) = (cfg.contract_v4_rates, selections_v4.is_empty()) {
-        let pool_ids: Vec<B256> = selections_v4.keys().copied().collect();
+    // Only pools both touched by this block's events and tracked via
+    // `poolState_addRatesPools` get rates data; an empty registry disables
+    // the rates call entirely.
+    let rates_pool_ids: Vec<B256> = selections_v4
+        .keys()
+        .filter(|id| rates_pools.contains_id(id))
+        .copied()
+        .collect();
+    if let (Some(rates_contract), false) =
+        (cfg.contract_v4_rates, rates_pool_ids.is_empty())
+    {
+        let call_pool_ids: Vec<B256> = rates_pool_ids.clone();
+        let pool_ids: Vec<B256> = rates_pool_ids;
 
         let call_started = std::time::Instant::now();
         match call_contract(
             &mut call_evm,
             evm_config,
             rates_contract,
-            IV4Rates::getMultiRatesArcCall { poolIds: pool_ids }
+            IV4Rates::getMultiRatesArcCall { poolIds: call_pool_ids }
                 .abi_encode()
                 .into(),
             chain_id,
@@ -598,7 +612,7 @@ fn process_chain<N>(
                     family = "v4",
                     call = "getMultiRatesArc",
                     block_number = tip.number(),
-                    pools = selections_v4.len(),
+                    pools = pool_ids.len(),
                     elapsed_ms = call_started.elapsed().as_millis() as u64,
                     "getMultiRatesArc call completed"
                 );

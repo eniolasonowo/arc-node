@@ -295,6 +295,9 @@ pub struct ArcRpcConfig {
     /// Optional receiver for pool-state snapshots published by the pool-state
     /// ExEx; enables the `poolState` RPC namespace.
     pub pool_state_rx: Option<tokio::sync::watch::Receiver<crate::rpc::pool_state::PoolStateSnapshot>>,
+    /// Shared registry of V4 pool ids eligible for rates data; enables the
+    /// `poolState_addRatesPools` method.
+    pub rates_pools: Option<crate::rpc::pool_state::RatesPoolRegistry>,
 }
 
 impl ArcRpcConfig {
@@ -303,7 +306,18 @@ impl ArcRpcConfig {
             enabled,
             upstream_url,
             pool_state_rx: None,
+            rates_pools: None,
         }
+    }
+
+    /// Attaches the shared rates pool registry, enabling the
+    /// `poolState_addRatesPools` method.
+    pub fn with_rates_pools(
+        mut self,
+        rates_pools: crate::rpc::pool_state::RatesPoolRegistry,
+    ) -> Self {
+        self.rates_pools = Some(rates_pools);
+        self
     }
 
     /// Attaches a pool-state snapshot receiver, enabling the `poolState` namespace.
@@ -482,8 +496,13 @@ where
                 }
 
                 if let Some(pool_state_rx) = self.arc_rpc.pool_state_rx.clone() {
+                    let rates_pools =
+                        self.arc_rpc.rates_pools.clone().unwrap_or_default();
                     container.modules.merge_configured(
-                        crate::rpc::pool_state::build_pool_state_rpc_module(pool_state_rx),
+                        crate::rpc::pool_state::build_pool_state_rpc_module(
+                            pool_state_rx,
+                            rates_pools,
+                        ),
                     )?;
                 }
 

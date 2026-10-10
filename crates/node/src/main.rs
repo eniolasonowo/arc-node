@@ -648,10 +648,13 @@ fn main() {
             };
             let (pool_state_tx, pool_state_rx) =
                 tokio::sync::watch::channel(Default::default());
+            let rates_pools = arc_evm_node::rpc::pool_state::RatesPoolRegistry::new();
             let arc_rpc_cfg =
                 ArcRpcConfig::new(ext.enable_arc_rpc, ext.arc_rpc_upstream_url.clone());
             let arc_rpc_cfg = if pool_state_cfg.is_some() {
-                arc_rpc_cfg.with_pool_state_rx(pool_state_rx)
+                arc_rpc_cfg
+                    .with_pool_state_rx(pool_state_rx)
+                    .with_rates_pools(rates_pools.clone())
             } else {
                 arc_rpc_cfg
             };
@@ -710,7 +713,12 @@ fn main() {
                     move |ctx| async move {
                         let cfg = pool_state_cfg
                             .expect("install_exex_if guarantees the config is present");
-                        Ok(arc_evm_node::exex::pool_state_exex(ctx, cfg, pool_state_tx))
+                        Ok(arc_evm_node::exex::pool_state_exex(
+                            ctx,
+                            cfg,
+                            pool_state_tx,
+                            rates_pools,
+                        ))
                     },
                 )
                 .launch_with_debug_capabilities()
