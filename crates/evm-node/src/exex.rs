@@ -34,10 +34,11 @@ use crate::rpc::lending::{
     TOPIC_LENDING_SUPPLY_COLLATERAL, TOPIC_LENDING_WITHDRAW, TOPIC_LENDING_WITHDRAW_COLLATERAL,
 };
 use crate::rpc::pool_state::{
-    default_topics, IV3PoolState, IV4PoolState, IV4Rates, LendingBlockUpdateData, MarketDetailEntry,
-    PoolRatesEntry, PoolStateEntry, PoolStateSnapshot, PoolStateWatch, RatesPoolRegistry,
-    TickRangeEntry, UserPositionEntry, TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN,
-    TOPIC_V3_MINT, TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
+    default_topics, IV3PoolState, IV3Rates, IV4PoolState, IV4Rates, LendingBlockUpdateData,
+    MarketDetailEntry, PoolRatesEntry, PoolStateEntry, PoolStateSnapshot, PoolStateWatch,
+    RatesPoolRegistry, TickRangeEntry, UserPositionEntry, V3RatesPoolRegistry,
+    TOPIC_PANCAKE_V3_SWAP, TOPIC_UNISWAP_V3_SWAP, TOPIC_V3_BURN, TOPIC_V3_MINT,
+    TOPIC_V4_MODIFY_LIQUIDITY, TOPIC_V4_SWAP,
 };
 use alloy_consensus::{BlockHeader as _, TxEip1559, TxReceipt as _};
 use alloy_primitives::{Address, Bytes, Log, Signed, TxKind, B256, I256, U160};
@@ -206,6 +207,8 @@ pub struct PoolStateConfig {
     pub contract_v4: Option<Address>,
     /// V4-family contract exposing `getMultiRatesArc` (bytes32-keyed pools).
     pub contract_v4_rates: Option<Address>,
+    /// V3-family contract exposing `getMultiRates` (address-keyed pools).
+    pub contract_v3_rates: Option<Address>,
     /// Lending contract exposing `blockUpdate` (bytes32-keyed markets).
     pub contract_lending: Option<Address>,
     /// Topic0 filter; defaults to [`default_topics`].
@@ -219,6 +222,7 @@ impl PoolStateConfig {
         contract_v3: Option<Address>,
         contract_v4: Option<Address>,
         contract_v4_rates: Option<Address>,
+        contract_v3_rates: Option<Address>,
         contract_lending: Option<Address>,
         topics: Option<Vec<B256>>,
     ) -> Self {
@@ -226,6 +230,7 @@ impl PoolStateConfig {
             contract_v3,
             contract_v4,
             contract_v4_rates,
+            contract_v3_rates,
             contract_lending,
             topics: topics.unwrap_or_else(default_topics),
         }
@@ -280,6 +285,7 @@ pub async fn pool_state_exex<N>(
     cfg: PoolStateConfig,
     watch: PoolStateWatch,
     rates_pools: RatesPoolRegistry,
+    v3_rates_pools: V3RatesPoolRegistry,
 ) -> eyre::Result<()>
 where
     N: FullNodeComponents<
@@ -309,6 +315,7 @@ where
                     ctx.components.provider(),
                     &watch,
                     &rates_pools,
+                    &v3_rates_pools,
                 );
             }
             ExExNotification::ChainReorged { .. } => {
@@ -346,6 +353,7 @@ fn process_chain<N>(
     provider: &N::Provider,
     watch: &PoolStateWatch,
     rates_pools: &RatesPoolRegistry,
+    v3_rates_pools: &V3RatesPoolRegistry,
 ) where
     N: FullNodeComponents<Evm = ArcEvmConfig, Types: NodeTypes<Primitives = EthPrimitives>>,
 {
@@ -644,6 +652,70 @@ fn process_chain<N>(
                 elapsed_ms = call_started.elapsed().as_millis() as u64,
                 error = %err,
                 "v4 getMultiRatesArc call failed; publishing ticks without rates"
+            ),
+        }
+    }
+
+    // V3 rates: only pools both touched by this block's events and tracked
+    // via `poolState_addV3RatesPools` get rates data; an empty registry
+    // disables the call entirely.
+    let v3_rates_pool_ids: Vec<Address> = selections_v3
+        .keys()
+        .filter(|pool| v3_rates_pools.contains_id(pool))
+        .copied()
+        .collect();
+    if let (Some(rates_contract), false) =
+        (cfg.contract_v3_rates, v3_rates_pool_ids.is_empty())
+    {
+        let call_pool_ids = v3_rates_pool_ids.clone();
+        let call_started = std::time::Instant::now();
+        match call_contract(
+            &mut call_evm,
+            evm_config,
+            rates_contract,
+            IV3Rates::getMultiRatesCall { poolAddresses: call_pool_ids }
+                .abi_encode()
+                .into(),
+            chain_id,
+        ) {
+            Ok(output) => {
+                tracing::info!(
+                    target: "arc::exex::pool_state",
+                    family = "v3",
+                    call = "getMultiRates",
+                    block_number = tip.number(),
+                    pools = v3_rates_pool_ids.len(),
+                    elapsed_ms = call_started.elapsed().as_millis() as u64,
+                    "getMultiRates call completed"
+                );
+                match IV3Rates::getMultiRatesCall::abi_decode_returns(&output) {
+                    Ok(returns) => {
+                        rates.extend(returns.iter().map(|r| PoolRatesEntry {
+                            pool_id: format!("{:#x}", r.poolAddress),
+                            rate0_in: r.rate0In.to_string(),
+                            delta0: r.delta0.to_string(),
+                            rate1_in: r.rate1In.to_string(),
+                            delta1: r.delta1.to_string(),
+                            rates0_out: r.rates0Out.iter().map(|v| v.to_string()).collect(),
+                            rates1_out: r.rates1Out.iter().map(|v| v.to_string()).collect(),
+                        }));
+                    }
+                    Err(err) => tracing::warn!(
+                        target: "arc::exex::pool_state",
+                        family = "v3",
+                        block_number = tip.number(),
+                        error = %err,
+                        "failed to decode v3 getMultiRates output; publishing ticks without rates"
+                    ),
+                }
+            }
+            Err(err) => tracing::warn!(
+                target: "arc::exex::pool_state",
+                family = "v3",
+                block_number = tip.number(),
+                elapsed_ms = call_started.elapsed().as_millis() as u64,
+                error = %err,
+                "v3 getMultiRates call failed; publishing ticks without rates"
             ),
         }
     }

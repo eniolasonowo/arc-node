@@ -298,6 +298,9 @@ pub struct ArcRpcConfig {
     /// Shared registry of V4 pool ids eligible for rates data; enables the
     /// `poolState_addRatesPools` method.
     pub rates_pools: Option<crate::rpc::pool_state::RatesPoolRegistry>,
+    /// Shared registry of V3 pool addresses eligible for rates data; enables
+    /// the `poolState_addV3RatesPools` method.
+    pub v3_rates_pools: Option<crate::rpc::pool_state::V3RatesPoolRegistry>,
 }
 
 impl ArcRpcConfig {
@@ -307,6 +310,7 @@ impl ArcRpcConfig {
             upstream_url,
             pool_state_rx: None,
             rates_pools: None,
+            v3_rates_pools: None,
         }
     }
 
@@ -317,6 +321,16 @@ impl ArcRpcConfig {
         rates_pools: crate::rpc::pool_state::RatesPoolRegistry,
     ) -> Self {
         self.rates_pools = Some(rates_pools);
+        self
+    }
+
+    /// Attaches the shared V3 rates pool registry, enabling the
+    /// `poolState_addV3RatesPools` method.
+    pub fn with_v3_rates_pools(
+        mut self,
+        v3_rates_pools: crate::rpc::pool_state::V3RatesPoolRegistry,
+    ) -> Self {
+        self.v3_rates_pools = Some(v3_rates_pools);
         self
     }
 
@@ -496,12 +510,14 @@ where
                 }
 
                 if let Some(pool_state_rx) = self.arc_rpc.pool_state_rx.clone() {
-                    let rates_pools =
-                        self.arc_rpc.rates_pools.clone().unwrap_or_default();
+                    let rates_pools = self.arc_rpc.rates_pools.clone().unwrap_or_default();
+                    let v3_rates_pools =
+                        self.arc_rpc.v3_rates_pools.clone().unwrap_or_default();
                     container.modules.merge_configured(
                         crate::rpc::pool_state::build_pool_state_rpc_module(
                             pool_state_rx,
                             rates_pools,
+                            v3_rates_pools,
                         ),
                     )?;
                 }

@@ -22,7 +22,7 @@
 //! publishes the decoded response on a [`watch`] channel; this module serves
 //! it as `poolState_latest` and `poolState_subscribe`.
 
-use alloy_primitives::{b256, B256, I256, U160};
+use alloy_primitives::{b256, Address, B256, I256, U160};
 use alloy_sol_types::sol;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, PendingSubscriptionSink, SubscriptionMessage};
 use tokio::sync::watch;
@@ -123,6 +123,25 @@ sol! {
             uint256[] rates1Out;
         }
         function getMultiRatesArc(bytes32[] memory poolIds)
+            public
+            returns (Rates[] memory rates);
+    }
+}
+
+// V3-family rates contract: pools are identified by address.
+sol! {
+    #[derive(Debug)]
+    interface IV3Rates {
+        struct Rates {
+            address poolAddress;
+            uint256 rate0In;
+            uint256 delta0;
+            uint256 rate1In;
+            uint256 delta1;
+            uint256[] rates0Out;
+            uint256[] rates1Out;
+        }
+        function getMultiRates(address[] memory poolAddresses)
             public
             returns (Rates[] memory rates);
     }
@@ -313,6 +332,45 @@ impl RatesPoolRegistry {
     }
 }
 
+/// Shared registry of V3 pool addresses eligible for `getMultiRates` data.
+/// Cheap to clone; clones share the same underlying set.
+#[derive(Debug, Default)]
+pub struct V3RatesPoolRegistry {
+    ids: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<Address>>>,
+}
+
+impl Clone for V3RatesPoolRegistry {
+    fn clone(&self) -> Self {
+        Self { ids: std::sync::Arc::clone(&self.ids) }
+    }
+}
+
+impl V3RatesPoolRegistry {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces the tracked pool address set with the given ids (deduped).
+    /// An empty slice disables V3 rates tracking.
+    pub fn replace_ids(&self, ids: Vec<Address>) {
+        let mut set = self.ids.write().expect("v3 rates pool registry poisoned");
+        set.clear();
+        set.extend(ids);
+    }
+
+    /// Returns the currently tracked pool addresses (sorted for a stable order).
+    pub fn ids(&self) -> Vec<Address> {
+        let set = self.ids.read().expect("v3 rates pool registry poisoned");
+        set.iter().copied().collect()
+    }
+
+    /// True when the pool address is tracked.
+    pub fn contains_id(&self, id: &Address) -> bool {
+        self.ids.read().expect("v3 rates pool registry poisoned").contains(id)
+    }
+}
+
 /// `poolState` namespace: latest snapshot + WS subscription.
 #[rpc(server, namespace = "poolState")]
 pub trait PoolStateApi {
@@ -326,6 +384,13 @@ pub trait PoolStateApi {
     #[method(name = "addRatesPools")]
     fn add_rates_pools(&self, ids: Vec<B256>) -> RpcResult<Vec<B256>>;
 
+    /// Replaces the tracked V3 rates pool address set with the given
+    /// addresses; only these pools will have `getMultiRates` data in
+    /// subsequent snapshots. An empty list disables V3 rates tracking.
+    /// Returns the new full list.
+    #[method(name = "addV3RatesPools")]
+    fn add_v3_rates_pools(&self, ids: Vec<Address>) -> RpcResult<Vec<Address>>;
+
     /// Subscribes to pool-state snapshots; one update per block that produced
     /// at least one matching event.
     #[subscription(name = "subscribe", unsubscribe = "unsubscribe", item = PoolStateSnapshot)]
@@ -337,6 +402,8 @@ pub struct PoolStateRpc {
     rx: watch::Receiver<PoolStateSnapshot>,
     /// Tracked V4 rates pool ids.
     rates_pools: RatesPoolRegistry,
+    /// Tracked V3 rates pool addresses.
+    v3_rates_pools: V3RatesPoolRegistry,
 }
 
 impl PoolStateApiServer for PoolStateRpc {
@@ -350,6 +417,11 @@ impl PoolStateApiServer for PoolStateRpc {
     fn add_rates_pools(&self, ids: Vec<B256>) -> RpcResult<Vec<B256>> {
         self.rates_pools.replace_ids(ids);
         Ok(self.rates_pools.ids())
+    }
+
+    fn add_v3_rates_pools(&self, ids: Vec<Address>) -> RpcResult<Vec<Address>> {
+        self.v3_rates_pools.replace_ids(ids);
+        Ok(self.v3_rates_pools.ids())
     }
 
     fn subscribe(&self, pending: PendingSubscriptionSink) {
@@ -380,10 +452,11 @@ impl PoolStateApiServer for PoolStateRpc {
 }
 
 /// Builds the `poolState` RPC module backed by the given watch receiver and
-/// rates pool registry.
+/// rates pool registries.
 pub fn build_pool_state_rpc_module(
     rx: watch::Receiver<PoolStateSnapshot>,
     rates_pools: RatesPoolRegistry,
+    v3_rates_pools: V3RatesPoolRegistry,
 ) -> jsonrpsee::RpcModule<PoolStateRpc> {
-    PoolStateRpc { rx, rates_pools }.into_rpc()
+    PoolStateRpc { rx, rates_pools, v3_rates_pools }.into_rpc()
 }

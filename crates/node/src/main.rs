@@ -195,6 +195,15 @@ struct ArcExtraCli {
     )]
     exex_pool_state_v4_rates_contract: Option<alloy_primitives::Address>,
 
+    /// V3-family contract exposing getMultiRates (address-keyed pools).
+    #[arg(
+        long = "exex.pool-state.v3-rates-contract",
+        value_name = "ADDRESS",
+        requires = "exex_pool_state",
+        help_heading = "Arc ExEx"
+    )]
+    exex_pool_state_v3_rates_contract: Option<alloy_primitives::Address>,
+
     /// Lending contract exposing blockUpdate (bytes32-keyed markets).
     #[arg(
         long = "exex.pool-state.lending-contract",
@@ -640,6 +649,7 @@ fn main() {
                     contract_v3,
                     contract_v4,
                     ext.exex_pool_state_v4_rates_contract,
+                    ext.exex_pool_state_v3_rates_contract,
                     ext.exex_pool_state_lending_contract,
                     ext.exex_pool_state_topics.clone(),
                 ))
@@ -649,12 +659,14 @@ fn main() {
             let (pool_state_tx, pool_state_rx) =
                 tokio::sync::watch::channel(Default::default());
             let rates_pools = arc_evm_node::rpc::pool_state::RatesPoolRegistry::new();
+            let v3_rates_pools = arc_evm_node::rpc::pool_state::V3RatesPoolRegistry::new();
             let arc_rpc_cfg =
                 ArcRpcConfig::new(ext.enable_arc_rpc, ext.arc_rpc_upstream_url.clone());
             let arc_rpc_cfg = if pool_state_cfg.is_some() {
                 arc_rpc_cfg
                     .with_pool_state_rx(pool_state_rx)
                     .with_rates_pools(rates_pools.clone())
+                    .with_v3_rates_pools(v3_rates_pools.clone())
             } else {
                 arc_rpc_cfg
             };
@@ -718,6 +730,7 @@ fn main() {
                             cfg,
                             pool_state_tx,
                             rates_pools,
+                            v3_rates_pools,
                         ))
                     },
                 )
